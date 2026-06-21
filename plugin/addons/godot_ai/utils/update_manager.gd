@@ -319,6 +319,8 @@ static func _is_trusted_download_url(url: String) -> bool:
 	var slash := rest.find("/")
 	if slash >= 0:
 		authority = rest.substr(0, slash)
+	if authority.find("\\") >= 0:
+		return false
 	## Host is everything after the LAST '@' (userinfo precedes it).
 	var at := authority.rfind("@")
 	if at >= 0:
@@ -484,7 +486,7 @@ static func _parse_sha256_digest(text: String) -> String:
 		return ""
 	## First whitespace-delimited token; `sha256sum` separates digest and
 	## filename with two spaces, so allow_empty=false collapses the run.
-	var tokens := trimmed.split(" ", false)
+	var tokens := trimmed.split("\t", false)[0].split(" ", false)
 	if tokens.is_empty():
 		return ""
 	var digest := String(tokens[0]).strip_edges().to_lower()
