@@ -122,8 +122,33 @@ func test_read_pid_file_round_trips_value() -> void:
 	assert_eq(McpPortResolver.read_pid_file(), 0)
 
 
+func test_server_pid_file_uses_agent_name_when_set() -> void:
+	var saved: Variant = _save_env("GODOT_AI_AGENT_NAME")
+	OS.set_environment("GODOT_AI_AGENT_NAME", "deepseek")
+	assert_eq(McpPortResolver.server_pid_file(), "user://godot_ai_server_deepseek.pid")
+	_restore_saved_env("GODOT_AI_AGENT_NAME", saved)
+
+
+func test_server_pid_file_sanitizes_agent_name() -> void:
+	var saved: Variant = _save_env("GODOT_AI_AGENT_NAME")
+	OS.set_environment("GODOT_AI_AGENT_NAME", "../Codex Lane!!")
+	assert_eq(McpPortResolver.server_pid_file(), "user://godot_ai_server_codex_lane.pid")
+	_restore_saved_env("GODOT_AI_AGENT_NAME", saved)
+
+
 func test_windows_powershell_candidates_prefers_system32_path() -> void:
 	## System32 must come first so a hijacked PATH can't intercept.
 	var candidates := McpPortResolver.windows_powershell_candidates()
 	assert_true(candidates.size() >= 3)
 	assert_true(candidates[0].ends_with("powershell.exe"))
+
+
+func _save_env(name: String) -> Variant:
+	return OS.get_environment(name) if OS.has_environment(name) else null
+
+
+func _restore_saved_env(name: String, saved: Variant) -> void:
+	if saved == null:
+		OS.unset_environment(name)
+	else:
+		OS.set_environment(name, str(saved))

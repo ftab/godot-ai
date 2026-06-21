@@ -641,7 +641,7 @@ func _build_ui() -> void:
 	_client_grid.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	clients_scroll.add_child(_client_grid)
 
-	for client_id in ClientConfigurator.client_ids():
+	for client_id in ClientConfigurator.scoped_client_ids():
 		_build_client_row(client_id)
 
 	_build_tools_tab(tabs)
@@ -2384,6 +2384,7 @@ func _server_blocked_client_message() -> String:
 func _refresh_drift_banner(mismatched_ids: Array[String]) -> void:
 	if _drift_banner == null:
 		return
+	mismatched_ids = _filter_managed_client_ids(mismatched_ids)
 	## Sort so set-equality is order-independent — `_client_rows` iteration
 	## order is dict-insertion order, but a future change to the iteration
 	## site shouldn't make us repaint identical content.
@@ -2404,6 +2405,14 @@ func _refresh_drift_banner(mismatched_ids: Array[String]) -> void:
 	var verb := "needs" if mismatched_ids.size() == 1 else "need"
 	_drift_label.text = "%s %s to be reconfigured." % [", ".join(names), verb]
 	_drift_banner.visible = true
+
+
+func _filter_managed_client_ids(client_ids: Array[String]) -> Array[String]:
+	var out: Array[String] = []
+	for id in client_ids:
+		if _client_rows.has(id) and out.find(id) == -1:
+			out.append(id)
+	return out
 
 
 func _on_reconfigure_mismatched() -> void:

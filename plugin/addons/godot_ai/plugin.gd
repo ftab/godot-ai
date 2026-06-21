@@ -1234,7 +1234,7 @@ static func _build_server_flags(port: int, ws_port: int) -> Array[String]:
 		"--transport", "streamable-http",
 		"--port", str(port),
 		"--ws-port", str(ws_port),
-		"--pid-file", ProjectSettings.globalize_path(SERVER_PID_FILE),
+		"--pid-file", ProjectSettings.globalize_path(PortResolver.server_pid_file()),
 	])
 	## Append `--exclude-domains` only when the user has actually picked at
 	## least one domain to drop. Skipping the empty case keeps spawns

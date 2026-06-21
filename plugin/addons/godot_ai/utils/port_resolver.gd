@@ -9,7 +9,33 @@ extends RefCounted
 ## Canonical pid-file path. plugin.gd::SERVER_PID_FILE re-exports this so
 ## external readers and tests can use either name.
 const SERVER_PID_FILE := "user://godot_ai_server.pid"
+const AGENT_NAME_ENV := "GODOT_AI_AGENT_NAME"
 const WindowsPortReservation := preload("res://addons/godot_ai/utils/windows_port_reservation.gd")
+
+
+static func server_pid_file() -> String:
+	var agent_name := _sanitize_agent_name(OS.get_environment(AGENT_NAME_ENV))
+	if agent_name.is_empty():
+		return SERVER_PID_FILE
+	return "user://godot_ai_server_%s.pid" % agent_name
+
+
+static func _sanitize_agent_name(raw: String) -> String:
+	var lower := raw.strip_edges().to_lower()
+	var out := ""
+	var previous_was_sep := false
+	for i in range(lower.length()):
+		var c := lower.unicode_at(i)
+		var alpha := (c >= 97 and c <= 122)
+		var digit := (c >= 48 and c <= 57)
+		var dash_or_under := c == 45 or c == 95
+		if alpha or digit or dash_or_under:
+			out += lower.substr(i, 1)
+			previous_was_sep = false
+		elif not previous_was_sep:
+			out += "_"
+			previous_was_sep = true
+	return out.strip_edges().trim_prefix("_").trim_suffix("_")
 
 
 static func can_bind_local_port(port: int) -> bool:
@@ -211,9 +237,10 @@ static func split_on_whitespace(s: String) -> PackedStringArray:
 
 
 static func read_pid_file() -> int:
-	if not FileAccess.file_exists(SERVER_PID_FILE):
+	var path := server_pid_file()
+	if not FileAccess.file_exists(path):
 		return 0
-	var f := FileAccess.open(SERVER_PID_FILE, FileAccess.READ)
+	var f := FileAccess.open(path, FileAccess.READ)
 	if f == null:
 		return 0
 	var content := f.get_as_text().strip_edges()
@@ -225,8 +252,9 @@ static func read_pid_file() -> int:
 
 
 static func clear_pid_file() -> void:
-	if FileAccess.file_exists(SERVER_PID_FILE):
-		DirAccess.remove_absolute(ProjectSettings.globalize_path(SERVER_PID_FILE))
+	var path := server_pid_file()
+	if FileAccess.file_exists(path):
+		DirAccess.remove_absolute(ProjectSettings.globalize_path(path))
 
 
 ## `kill -0` returns 0 for both running and zombie processes; Godot

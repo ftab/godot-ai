@@ -35,24 +35,34 @@ const SERVER_NAME := "godot-ai"
 const DEFAULT_HTTP_PORT := 8000
 const DEFAULT_WS_PORT := 9500
 const STARTUP_TRACE_ENV := "GODOT_AI_STARTUP_TRACE"
+const HTTP_PORT_ENV := "GODOT_AI_HTTP_PORT"
+const WS_PORT_ENV := "GODOT_AI_WS_PORT"
+const CLIENT_ID_ENV := "GODOT_AI_CLIENT_ID"
+const CLIENT_IDS_ENV := "GODOT_AI_CLIENT_IDS"
+const AGENT_NAME_ENV := "GODOT_AI_AGENT_NAME"
 const MIN_PORT := 1024
 const MAX_PORT := 65535
 const SETTING_WS_PORT := "godot_ai/ws_port"
 const SETTING_STARTUP_TRACE := "godot_ai/log_startup_timing"
 
 
-## Active HTTP port: user override (if in range) or `DEFAULT_HTTP_PORT`.
+## Active HTTP port: process env override, user override (if in range), or `DEFAULT_HTTP_PORT`.
 static func http_port() -> int:
-	return _read_port_setting(McpSettings.SETTING_HTTP_PORT, DEFAULT_HTTP_PORT)
+	return _read_env_or_port_setting(HTTP_PORT_ENV, McpSettings.SETTING_HTTP_PORT, DEFAULT_HTTP_PORT)
 
 
-## Active WebSocket port: user override (if in range) or `DEFAULT_WS_PORT`.
+## Active WebSocket port: process env override, user override (if in range), or `DEFAULT_WS_PORT`.
 static func ws_port() -> int:
-	return _read_port_setting(SETTING_WS_PORT, DEFAULT_WS_PORT)
+	return _read_env_or_port_setting(WS_PORT_ENV, SETTING_WS_PORT, DEFAULT_WS_PORT)
 
 
 static func http_url() -> String:
 	return "http://127.0.0.1:%d/mcp" % http_port()
+
+
+static func _read_env_or_port_setting(env_key: String, setting_key: String, default_port: int) -> int:
+	var setting_port := _read_port_setting(setting_key, default_port)
+	return McpSettings.env_int_in_range(env_key, MIN_PORT, MAX_PORT, setting_port)
 
 
 static func _read_port_setting(key: String, default_port: int) -> int:
@@ -146,6 +156,81 @@ static func suggest_free_port(start: int, span: int = 2048) -> int:
 
 static func client_ids() -> PackedStringArray:
 	return ClientRegistry.ids()
+
+
+## Client rows/actions that belong to this editor lane. Defaults to every
+## supported client for normal single-editor installs. Multi-editor agent lanes
+## can set `GODOT_AI_CLIENT_ID=codex` or `GODOT_AI_CLIENT_IDS=codex,claude_code`
+## so this editor only reports/reconfigures the designated client(s) instead of
+## treating clients intentionally pointed at another lane's port as stale.
+##
+## If no explicit client env is set, an exact normalized `GODOT_AI_AGENT_NAME`
+## match (for example `codex` or `claude-code`) is accepted as a convenience.
+## Ambiguous/non-matching agent names fall back to all clients to preserve
+## historical behavior.
+static func scoped_client_ids() -> PackedStringArray:
+	var env_scope := _client_ids_from_scope_env()
+	if bool(env_scope.get("set", false)):
+		return env_scope.get("ids", PackedStringArray())
+
+	var agent_match := _match_client_selector(OS.get_environment(AGENT_NAME_ENV))
+	if not agent_match.is_empty():
+		var inferred := PackedStringArray()
+		inferred.append(agent_match)
+		return inferred
+
+	return client_ids()
+
+
+static func _client_ids_from_scope_env() -> Dictionary:
+	var raw := OS.get_environment(CLIENT_IDS_ENV).strip_edges()
+	if raw.is_empty():
+		raw = OS.get_environment(CLIENT_ID_ENV).strip_edges()
+	if raw.is_empty():
+		return {"set": false, "ids": PackedStringArray()}
+	return {"set": true, "ids": _parse_client_selector_list(raw)}
+
+
+static func _parse_client_selector_list(raw: String) -> PackedStringArray:
+	var out := PackedStringArray()
+	var normalized_raw := raw.replace(";", ",")
+	for token in normalized_raw.split(",", false):
+		var id := _match_client_selector(String(token))
+		if id.is_empty():
+			push_warning("MCP | ignoring unknown GODOT_AI_CLIENT_ID(S) entry: %s" % String(token).strip_edges())
+			continue
+		if out.find(id) == -1:
+			out.append(id)
+	return out
+
+
+static func _match_client_selector(raw: String) -> String:
+	var normalized := _normalize_client_selector(raw)
+	if normalized.is_empty():
+		return ""
+	if ClientRegistry.has_id(normalized):
+		return normalized
+	for client in ClientRegistry.all():
+		if _normalize_client_selector(client.display_name) == normalized:
+			return client.id
+	return ""
+
+
+static func _normalize_client_selector(raw: String) -> String:
+	var lower := raw.strip_edges().to_lower()
+	var out := ""
+	var previous_was_sep := false
+	for i in range(lower.length()):
+		var c := lower.unicode_at(i)
+		var alpha := (c >= 97 and c <= 122)
+		var digit := (c >= 48 and c <= 57)
+		if alpha or digit:
+			out += lower.substr(i, 1)
+			previous_was_sep = false
+		elif not previous_was_sep:
+			out += "_"
+			previous_was_sep = true
+	return out.trim_prefix("_").trim_suffix("_")
 
 
 static func has_client(id: String) -> bool:

@@ -6,6 +6,7 @@ extends McpTestSuite
 
 const _TENV1 := "GODOT_AI_DISABLE_TELEMETRY"
 const _TENV2 := "DISABLE_TELEMETRY"
+const _PORT_ENV := "GODOT_AI_TEST_PORT"
 
 var _saved_tenv1: Variant = null
 var _saved_tenv2: Variant = null
@@ -27,6 +28,7 @@ func suite_setup(_ctx: Dictionary) -> void:
 func suite_teardown() -> void:
 	_restore_env(_TENV1, _saved_tenv1)
 	_restore_env(_TENV2, _saved_tenv2)
+	OS.unset_environment(_PORT_ENV)
 	# NB: If originally unset, _saved_telemetry_setting will be null and this will unset any
 	# value set by tests. No-op if already unset and then set to null.
 	EditorInterface.get_editor_settings().set_setting(McpSettings.SETTING_TELEMETRY_ENABLED, _saved_telemetry_setting)
@@ -89,6 +91,25 @@ func test_env_truthy_returns_false_when_var_set_falsy() -> void:
 func test_env_truthy_returns_false_when_var_absent() -> void:
 	OS.unset_environment(_TENV1)
 	assert_false(McpSettings.env_truthy(_TENV1))
+
+
+# ----- env_int_in_range -----
+
+func test_env_int_in_range_returns_env_value_when_valid() -> void:
+	OS.set_environment(_PORT_ENV, "18001")
+	assert_eq(McpSettings.env_int_in_range(_PORT_ENV, 1024, 65535, 8000), 18001)
+
+func test_env_int_in_range_strips_whitespace() -> void:
+	OS.set_environment(_PORT_ENV, " 18002\n")
+	assert_eq(McpSettings.env_int_in_range(_PORT_ENV, 1024, 65535, 8000), 18002)
+
+func test_env_int_in_range_rejects_non_int() -> void:
+	OS.set_environment(_PORT_ENV, "not-a-port")
+	assert_eq(McpSettings.env_int_in_range(_PORT_ENV, 1024, 65535, 8000), 8000)
+
+func test_env_int_in_range_rejects_out_of_range() -> void:
+	OS.set_environment(_PORT_ENV, "80")
+	assert_eq(McpSettings.env_int_in_range(_PORT_ENV, 1024, 65535, 8000), 8000)
 
 
 # ----- telemetry_enabled -----

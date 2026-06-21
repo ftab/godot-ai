@@ -59,6 +59,9 @@ class _RestartDispatchPlugin extends GodotAiPlugin:
 
 
 var _dock: Node
+var _saved_client_id_env: Variant = null
+var _saved_client_ids_env: Variant = null
+var _saved_agent_name_env: Variant = null
 
 
 func suite_name() -> String:
@@ -66,6 +69,12 @@ func suite_name() -> String:
 
 
 func suite_setup(_ctx: Dictionary) -> void:
+	_saved_client_id_env = _save_env(McpClientConfigurator.CLIENT_ID_ENV)
+	_saved_client_ids_env = _save_env(McpClientConfigurator.CLIENT_IDS_ENV)
+	_saved_agent_name_env = _save_env("GODOT_AI_AGENT_NAME")
+	OS.unset_environment(McpClientConfigurator.CLIENT_ID_ENV)
+	OS.unset_environment(McpClientConfigurator.CLIENT_IDS_ENV)
+	OS.unset_environment("GODOT_AI_AGENT_NAME")
 	_dock = McpDockScript.new()
 
 
@@ -73,6 +82,9 @@ func suite_teardown() -> void:
 	if _dock != null:
 		_dock.free()
 		_dock = null
+	_restore_env(McpClientConfigurator.CLIENT_ID_ENV, _saved_client_id_env)
+	_restore_env(McpClientConfigurator.CLIENT_IDS_ENV, _saved_client_ids_env)
+	_restore_env("GODOT_AI_AGENT_NAME", _saved_agent_name_env)
 
 
 func test_install_mode_text_matches_environment() -> void:
@@ -143,6 +155,44 @@ func test_drift_banner_no_op_when_mismatched_set_unchanged() -> void:
 	_dock._refresh_drift_banner(["codex"] as Array[String])
 	assert_true(_dock._drift_label.text != "SENTINEL — should survive a no-op refresh")
 	assert_true(_dock._drift_label.text != first_text, "Different set must produce different text")
+
+
+
+func test_client_rows_are_scoped_by_explicit_client_env() -> void:
+	var saved_id: Variant = _save_env(McpClientConfigurator.CLIENT_ID_ENV)
+	var saved_ids: Variant = _save_env(McpClientConfigurator.CLIENT_IDS_ENV)
+	var saved_agent: Variant = _save_env("GODOT_AI_AGENT_NAME")
+	OS.set_environment(McpClientConfigurator.CLIENT_ID_ENV, "codex")
+	OS.unset_environment(McpClientConfigurator.CLIENT_IDS_ENV)
+	OS.unset_environment("GODOT_AI_AGENT_NAME")
+	var dock: McpDock = McpDockScript.new()
+	dock._build_ui()
+	assert_true(dock._client_rows.has("codex"), "designated client row should be present")
+	assert_false(dock._client_rows.has("claude_code"), "unrelated client row should not be managed by this editor lane")
+	dock.free()
+	_restore_env(McpClientConfigurator.CLIENT_ID_ENV, saved_id)
+	_restore_env(McpClientConfigurator.CLIENT_IDS_ENV, saved_ids)
+	_restore_env("GODOT_AI_AGENT_NAME", saved_agent)
+
+
+func test_drift_banner_scoping_ignores_unmanaged_mismatched_clients() -> void:
+	var saved_id: Variant = _save_env(McpClientConfigurator.CLIENT_ID_ENV)
+	var saved_ids: Variant = _save_env(McpClientConfigurator.CLIENT_IDS_ENV)
+	var saved_agent: Variant = _save_env("GODOT_AI_AGENT_NAME")
+	OS.set_environment(McpClientConfigurator.CLIENT_ID_ENV, "codex")
+	OS.unset_environment(McpClientConfigurator.CLIENT_IDS_ENV)
+	OS.unset_environment("GODOT_AI_AGENT_NAME")
+	var dock: McpDock = McpDockScript.new()
+	dock._build_ui()
+	dock._refresh_drift_banner(["codex", "claude_code"] as Array[String])
+	assert_true(dock._drift_banner.visible, "managed mismatch should show banner")
+	assert_contains(dock._drift_label.text, "Codex")
+	assert_false(dock._drift_label.text.contains("Claude Code"), "unmanaged mismatches should not be offered for reconfigure")
+	assert_eq(dock._last_mismatched_ids, ["codex"] as Array[String])
+	dock.free()
+	_restore_env(McpClientConfigurator.CLIENT_ID_ENV, saved_id)
+	_restore_env(McpClientConfigurator.CLIENT_IDS_ENV, saved_ids)
+	_restore_env("GODOT_AI_AGENT_NAME", saved_agent)
 
 
 func test_mixed_state_banner_hidden_in_clean_addons_tree() -> void:
@@ -1135,3 +1185,13 @@ func test_primary_btn_shows_restarting_state_during_dispatch() -> void:
 		"Once the flag clears, primary label reverts")
 	assert_false(post_disabled,
 		"Cleared flag with managed server still up must re-enable the primary")
+
+func _save_env(name: String) -> Variant:
+	return OS.get_environment(name) if OS.has_environment(name) else null
+
+
+func _restore_env(name: String, saved: Variant) -> void:
+	if saved == null:
+		OS.unset_environment(name)
+	else:
+		OS.set_environment(name, str(saved))

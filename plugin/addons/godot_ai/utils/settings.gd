@@ -26,6 +26,19 @@ static func env_truthy(var_name: String) -> bool:
 	return truthy(OS.get_environment(var_name))
 
 
+## Read an integer from an environment variable, accepting it only when it is
+## within [`min_value`, `max_value`]. Returns `fallback` when unset, malformed,
+## or out of range.
+static func env_int_in_range(var_name: String, min_value: int, max_value: int, fallback: int) -> int:
+	var raw := OS.get_environment(var_name).strip_edges()
+	if not raw.is_valid_int():
+		return fallback
+	var value := int(raw)
+	if value < min_value or value > max_value:
+		return fallback
+	return value
+
+
 ## Returns true if telemetry should be active, checking in priority order:
 ##   1. GODOT_AI_DISABLE_TELEMETRY / DISABLE_TELEMETRY env vars
 ##   2. The godot_ai/telemetry_enabled EditorSetting written by the dock UI
