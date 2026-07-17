@@ -667,18 +667,24 @@ func test_is_symlink_detects_real_symlink() -> void:
 
 # ----- port configuration -----
 #
-# http_port() / ws_port() read EditorSettings overrides and fall back to the
-# baked-in defaults when the override is unset or out of [1024, 65535]. Each
-# test owns its teardown via `_clear_port_settings` so a failure in the middle
-# can't leak a bogus port into later assertions or the user's real editor.
+# Without an explicit per-process lane, http_port() / ws_port() read
+# EditorSettings overrides and fall back to the baked-in defaults when the
+# override is unset or out of [1024, 65535]. Each test owns its teardown via
+# `_clear_port_settings` so a failure in the middle can't leak a bogus port into
+# later assertions or the user's real editor. Lane precedence has separate
+# coverage in test_client_configurator_env_ports.gd.
 
 
 func test_http_port_defaults_when_setting_absent() -> void:
+	if _skip_editor_setting_port_test_in_isolated_lane():
+		return
 	_clear_port_settings()
 	assert_eq(McpClientConfigurator.http_port(), McpClientConfigurator.DEFAULT_HTTP_PORT)
 
 
 func test_http_port_reads_configured_value() -> void:
+	if _skip_editor_setting_port_test_in_isolated_lane():
+		return
 	_clear_port_settings()
 	var es := EditorInterface.get_editor_settings()
 	assert_true(es != null, "EditorSettings unavailable")
@@ -688,6 +694,8 @@ func test_http_port_reads_configured_value() -> void:
 
 
 func test_http_port_rejects_out_of_range() -> void:
+	if _skip_editor_setting_port_test_in_isolated_lane():
+		return
 	## Privileged ports and anything above 65535 must fall back to the default,
 	## not be returned verbatim — the Python server would refuse to bind and
 	## the dock would be left with a useless number in the label.
@@ -702,11 +710,15 @@ func test_http_port_rejects_out_of_range() -> void:
 
 
 func test_ws_port_defaults_when_setting_absent() -> void:
+	if _skip_editor_setting_port_test_in_isolated_lane():
+		return
 	_clear_port_settings()
 	assert_eq(McpClientConfigurator.ws_port(), McpClientConfigurator.DEFAULT_WS_PORT)
 
 
 func test_ws_port_reads_configured_value() -> void:
+	if _skip_editor_setting_port_test_in_isolated_lane():
+		return
 	_clear_port_settings()
 	var es := EditorInterface.get_editor_settings()
 	assert_true(es != null, "EditorSettings unavailable")
@@ -716,6 +728,8 @@ func test_ws_port_reads_configured_value() -> void:
 
 
 func test_ws_port_rejects_out_of_range() -> void:
+	if _skip_editor_setting_port_test_in_isolated_lane():
+		return
 	_clear_port_settings()
 	var es := EditorInterface.get_editor_settings()
 	assert_true(es != null, "EditorSettings unavailable")
@@ -727,6 +741,8 @@ func test_ws_port_rejects_out_of_range() -> void:
 
 
 func test_http_url_uses_current_http_port() -> void:
+	if _skip_editor_setting_port_test_in_isolated_lane():
+		return
 	## http_url() is the single funnel every MCP-client descriptor flows through
 	## when building `url` / `serverUrl` / `httpUrl` entries. If it drifts from
 	## http_port() we would silently configure clients against the wrong port.
@@ -2071,7 +2087,14 @@ func test_handler_status_returns_array_of_clients() -> void:
 	assert_has_key(result.data, "clients")
 	var clients = result.data.clients
 	assert_true(clients is Array)
-	assert_gt(clients.size(), 10)
+	var scoped_ids := McpClientConfigurator.scoped_client_ids()
+	assert_eq(
+		clients.size(),
+		scoped_ids.size(),
+		"handler must report exactly the clients assigned to this editor lane",
+	)
+	if not McpClientConfigurator.isolated_lane_requested():
+		assert_gt(clients.size(), 10)
 	# Each entry must include id / display_name / status / installed.
 	# `status` is one of the four documented strings; agents pattern-match
 	# against this set, so a fifth value being silently introduced would
@@ -2850,6 +2873,13 @@ func _clear_port_settings() -> void:
 		return
 	es.set_setting(McpSettings.SETTING_HTTP_PORT, McpClientConfigurator.DEFAULT_HTTP_PORT)
 	es.set_setting(McpClientConfigurator.SETTING_WS_PORT, McpClientConfigurator.DEFAULT_WS_PORT)
+
+
+func _skip_editor_setting_port_test_in_isolated_lane() -> bool:
+	if not McpClientConfigurator.isolated_lane_requested():
+		return false
+	skip("EditorSettings port behavior is superseded by this process's env lane")
+	return true
 
 
 func _restore_port_settings() -> void:

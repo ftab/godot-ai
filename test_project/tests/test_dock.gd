@@ -79,6 +79,9 @@ static func _finished_thread_payload(payload: Dictionary) -> Dictionary:
 
 
 var _dock: Node
+var _saved_client_id_env: Variant = null
+var _saved_client_ids_env: Variant = null
+var _saved_agent_name_env: Variant = null
 
 
 func suite_name() -> String:
@@ -86,6 +89,13 @@ func suite_name() -> String:
 
 
 func suite_setup(_ctx: Dictionary) -> void:
+	_saved_client_id_env = _save_env(McpClientConfigurator.CLIENT_ID_ENV)
+	_saved_client_ids_env = _save_env(McpClientConfigurator.CLIENT_IDS_ENV)
+	_saved_agent_name_env = _save_env(McpClientConfigurator.AGENT_NAME_ENV)
+	OS.unset_environment(McpClientConfigurator.CLIENT_ID_ENV)
+	OS.unset_environment(McpClientConfigurator.CLIENT_IDS_ENV)
+	OS.unset_environment(McpClientConfigurator.AGENT_NAME_ENV)
+	McpClientConfigurator.warm_env_snapshot()
 	_dock = McpDockScript.new()
 
 
@@ -93,6 +103,10 @@ func suite_teardown() -> void:
 	if _dock != null:
 		_dock.free()
 		_dock = null
+	_restore_env(McpClientConfigurator.CLIENT_ID_ENV, _saved_client_id_env)
+	_restore_env(McpClientConfigurator.CLIENT_IDS_ENV, _saved_client_ids_env)
+	_restore_env(McpClientConfigurator.AGENT_NAME_ENV, _saved_agent_name_env)
+	McpClientConfigurator.warm_env_snapshot()
 
 
 func test_install_mode_text_matches_environment() -> void:
@@ -115,6 +129,20 @@ func test_install_label_mouse_filter_allows_tooltip() -> void:
 	# events and prevents tooltip_text from ever firing. Regression guard.
 	_dock._build_ui()
 	assert_eq(_dock._install_label.mouse_filter, Control.MOUSE_FILTER_STOP)
+
+
+func test_client_rows_are_scoped_by_explicit_lane_client() -> void:
+	OS.set_environment(McpClientConfigurator.CLIENT_ID_ENV, "codex")
+	var dock := McpDockScript.new()
+	dock._build_ui()
+	assert_true(dock._client_rows.has("codex"), "designated client row should be present")
+	assert_false(
+		dock._client_rows.has("claude_code"),
+		"another lane's client row should not be managed here",
+	)
+	dock.free()
+	OS.unset_environment(McpClientConfigurator.CLIENT_ID_ENV)
+	McpClientConfigurator.warm_env_snapshot()
 
 
 func test_clients_header_and_actions_use_narrow_layout() -> void:
@@ -788,6 +816,18 @@ func test_crashed_body_mentions_pypi_propagation_on_uvx_tier() -> void:
 		assert_contains(body, "output log", "Non-uvx body should still point at Godot's traceback")
 
 
+func test_crashed_body_prefers_actionable_lifecycle_message() -> void:
+	var message := (
+		"Isolated Godot AI lanes require both GODOT_AI_HTTP_PORT and "
+		+ "GODOT_AI_WS_PORT."
+	)
+	var body := McpDockScript._crash_body_for_state(
+		McpServerState.CRASHED,
+		{"message": message},
+	)
+	assert_eq(body, message)
+
+
 func test_foreign_port_body_prefers_lifecycle_message() -> void:
 	## #647: when the post-crash probe diagnosed which port a foreign
 	## process holds, the crash body must render that message verbatim
@@ -1238,6 +1278,8 @@ func test_foreign_incompatible_body_names_concrete_free_ports() -> void:
 	var http_port := McpClientConfigurator.http_port()
 	var free_http := McpClientConfigurator.suggest_free_port(http_port + 1)
 	var free_ws := McpClientConfigurator.suggest_free_port(McpClientConfigurator.ws_port() + 1)
+	if free_ws == free_http:
+		free_ws = McpClientConfigurator.suggest_free_port(free_ws + 1)
 	var body := McpDockScript._crash_body_for_state(
 		McpServerState.INCOMPATIBLE,
 		{"message": "Port %d is occupied by another process." % http_port},
@@ -1246,10 +1288,16 @@ func test_foreign_incompatible_body_names_concrete_free_ports() -> void:
 		"foreign-occupant body must name a concrete free HTTP port")
 	assert_contains(body, "%d (WS)" % free_ws,
 		"foreign-occupant body must name a concrete free WS port")
-	assert_contains(body, "godot_ai/http_port",
-		"foreign-occupant body must point at the HTTP Editor Setting to change")
-	assert_contains(body, "godot_ai/ws_port",
-		"foreign-occupant body must point at the WS Editor Setting too")
+	if McpClientConfigurator.isolated_lane_requested():
+		assert_contains(body, "GODOT_AI_HTTP_PORT",
+			"env lane body must point at the HTTP launch variable")
+		assert_contains(body, "GODOT_AI_WS_PORT",
+			"env lane body must point at the WS launch variable")
+	else:
+		assert_contains(body, "godot_ai/http_port",
+			"foreign-occupant body must point at the HTTP Editor Setting to change")
+		assert_contains(body, "godot_ai/ws_port",
+			"foreign-occupant body must point at the WS Editor Setting too")
 
 
 func test_recoverable_incompatible_body_keeps_restart_copy() -> void:
@@ -1805,3 +1853,14 @@ func test_tool_catalog_is_excludable_domain_filters_unknown_names() -> void:
 		"a name no longer in the catalog must be rejected")
 	assert_false(McpToolCatalog.is_excludable_domain(""),
 		"empty is not a domain")
+
+
+func _save_env(name: String) -> Variant:
+	return OS.get_environment(name) if OS.has_environment(name) else null
+
+
+func _restore_env(name: String, saved: Variant) -> void:
+	if saved == null:
+		OS.unset_environment(name)
+	else:
+		OS.set_environment(name, str(saved))

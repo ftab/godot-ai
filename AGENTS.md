@@ -114,7 +114,7 @@ Wiring: `script/setup-dev` and `script/setup-dev.ps1` copy `script/githooks/post
 
 **If you find a broken worktree** (empty `plugin/`, or the link missing/stale): do NOT `git add` anything. Run `script/verify-worktree` to heal, or re-create the worktree. Committing plugin/ edits from a broken worktree stages phantom deletions that overwrite the canonical plugin code in main on push.
 
-**Parallel plugin development IS supported** — each worktree has its own `plugin/` (standard git worktree semantics) and its own locally-built `test_project/addons/godot_ai` link. Multiple Godot editors, one per worktree, all connect to the same MCP server on :8000; use `session_activate` (or `session_id` per call) to route. The ban is only on editing in *broken* worktrees.
+**Parallel plugin development IS supported** — each worktree has its own `plugin/` (standard git worktree semantics) and its own locally-built `test_project/addons/godot_ai` link. A shared server on :8000 is appropriate only when every editor intentionally uses the same Python source; its active session is global, so concurrent agents must pass `session_id` on every call. For independent worktree code and teardown, give every editor process a unique `GODOT_AI_HTTP_PORT` + `GODOT_AI_WS_PORT` pair and point that agent's isolated client config at the matching URL. See `docs/port-conflicts.md`. The ban is only on editing in *broken* worktrees.
 
 ### Godot editor + worktree safety
 
@@ -150,7 +150,7 @@ Sometimes you're directed at another session's PR worktree (e.g. to fix a bug th
 
 1. **Inspect before you touch**: run `git status` and `git diff --stat` in the target worktree first so you know which files are already dirty — that's the other session's work, not your canvas.
 2. **Stage by explicit path**: `git add plugin/foo.gd test_project/tests/test_foo.gd`, never `git add .` or `git add -A`. Even if their uncommitted work looks related to yours, it isn't yours to commit.
-3. **Multi-editor is fine when you need the PR's live plugin code**: launch a second Godot editor pointed at the PR worktree's `test_project/` alongside any existing editor — both connect to the same MCP server on port 8000 and show up in `session_list`. Use `session_activate` to pin your commands to the right session. This beats killing the other session's editor or rsync'ing PR code over an unrelated project.
+3. **Multi-editor is fine when you need the PR's live plugin code**: for divergent worktrees, launch the second editor with its own `GODOT_AI_HTTP_PORT` + `GODOT_AI_WS_PORT` pair and point that agent's isolated client config at the matching URL. A shared server on port 8000 is only appropriate when both editors intentionally use the same Python source; in that mode pass an exact `session_id` on every call rather than racing the global `session_activate`. This beats killing the other session's editor or rsync'ing PR code over an unrelated project.
 4. **Accept the auto-clean risk**: a worktree owned by another session can be removed when that session exits. Commit (and ideally push) as soon as your fix and tests are green — don't leave uncommitted work in a worktree you don't own.
 5. **Revert your own autosave pollution** before committing (see "Live-smoke scene hygiene"). Running the scene during smoke will dirty the scene file with any in-memory mutations you staged.
 6. **Push only what's yours**: don't push the branch if it still contains another session's uncommitted experimental work — they may not be ready. When in doubt, commit locally and ask.

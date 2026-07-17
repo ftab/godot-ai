@@ -272,6 +272,35 @@ func test_blocked_connection_logs_once_and_stops_reconnect_loop() -> void:
 	conn.free()
 
 
+func test_resume_connecting_unblocks_and_reinitializes_peer() -> void:
+	## Isolated lanes construct a blocked Connection while the lifecycle walk
+	## resolves their endpoint. Once proof/spawn succeeds, resume_connecting
+	## must discard any stale socket state and dial the final WS port.
+	var conn := McpConnection.new()
+	conn.log_buffer = McpLogBuffer.new()
+	conn.connect_blocked = true
+	conn.connect_block_reason = "resolving lane"
+	conn.ws_port = 1
+	var tree := Engine.get_main_loop() as SceneTree
+	tree.root.add_child(conn)
+	var old_peer := conn._peer
+	conn._reconnect_attempt = 7
+	conn._reconnect_timer = 12.0
+
+	conn.resume_connecting()
+
+	assert_false(conn.connect_blocked)
+	assert_eq(conn.connect_block_reason, "")
+	assert_true(conn._peer != old_peer, "resume must discard a stale lane socket")
+	assert_eq(conn._reconnect_attempt, 0)
+	assert_eq(conn._reconnect_timer, 0.0)
+	assert_eq(conn._url, "ws://127.0.0.1:1")
+	assert_true(conn.is_processing(), "resumed Connection must restart socket polling")
+	conn.teardown()
+	tree.root.remove_child(conn)
+	conn.free()
+
+
 # ----- pause depth -----
 
 

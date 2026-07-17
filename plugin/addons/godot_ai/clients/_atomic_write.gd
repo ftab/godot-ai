@@ -45,12 +45,19 @@ static func write(path: String, content: String) -> bool:
 	var file := FileAccess.open(tmp_path, FileAccess.WRITE)
 	if file == null:
 		return false
-	# Lock the temp inode down BEFORE writing any bytes. FileAccess.open creates
-	# it at the umask default (often 0644); chmod'ing the still-empty file first
-	# means the config contents are never on disk under a world-readable mode in
-	# the create->chmod gap. rename preserves the inode mode, so the swapped-in
-	# file lands correct and is never briefly world-readable under the target name.
-	_apply_mode(tmp_path, target_mode)
+	# Lock the temp inode down BEFORE writing any bytes. Godot 4.6 on macOS
+	# rejects set_unix_permissions while this FileAccess handle is open, so
+	# close the still-empty inode, chmod it, then reopen that same inode without
+	# recreating it. This matters for token-bearing runtime records: the temp
+	# must never contain secrets under the umask default (often 0644).
+	file.close()
+	if not _apply_mode(tmp_path, target_mode):
+		DirAccess.remove_absolute(tmp_path)
+		return false
+	file = FileAccess.open(tmp_path, FileAccess.READ_WRITE)
+	if file == null:
+		DirAccess.remove_absolute(tmp_path)
+		return false
 	file.store_string(content)
 	# Push Godot's internal buffer out to the OS before the rename. Godot
 	# exposes no fsync, so the bytes aren't guaranteed durable on the physical
@@ -64,7 +71,9 @@ static func write(path: String, content: String) -> bool:
 	# (a chmod issued while the FileAccess handle is still open doesn't reliably
 	# stick inside the editor) and guarantees the final mode before the rename,
 	# which preserves it.
-	_apply_mode(tmp_path, target_mode)
+	if not _apply_mode(tmp_path, target_mode):
+		DirAccess.remove_absolute(tmp_path)
+		return false
 
 	# Verify the staged temp landed intact before committing it anywhere. The
 	# copy-fallback path below already guards this (`_written_size_matches` at
@@ -92,8 +101,11 @@ static func write(path: String, content: String) -> bool:
 	if had_original:
 		DirAccess.remove_absolute(backup_path)
 		if DirAccess.copy_absolute(path, backup_path) == OK:
-			backup_made = true
-			_apply_mode(backup_path, target_mode)
+			backup_made = _apply_mode(backup_path, target_mode)
+			if not backup_made:
+				# Never retain an insecure rollback copy of a token-bearing
+				# config when its intended mode could not be applied.
+				DirAccess.remove_absolute(backup_path)
 
 	if DirAccess.rename_absolute(tmp_path, path) == OK:
 		return true
@@ -104,12 +116,15 @@ static func write(path: String, content: String) -> bool:
 	# leaves the user's prior config in place rather than nuking it.
 	if DirAccess.copy_absolute(tmp_path, path) == OK and _written_size_matches(path, content):
 		# copy_absolute creates the destination with the default mode, so
-		# re-apply the preserved/owner-only mode after the copy lands.
-		_apply_mode(path, target_mode)
-		DirAccess.remove_absolute(tmp_path)
-		return true
+		# re-apply the preserved/owner-only mode after the copy lands. A mode
+		# failure is a failed commit: managed records contain a WS token and
+		# must never report success while left at the umask default.
+		if _apply_mode(path, target_mode):
+			DirAccess.remove_absolute(tmp_path)
+			return true
 
-	# Copy didn't land cleanly. Restore the destination to its pre-call state.
+	# Copy didn't land cleanly or its final mode could not be secured. Restore
+	# the destination to its pre-call state.
 	if backup_made:
 		# Restore the snapshot we took before the swap. `copy_absolute`
 		# overwrites the destination, so we don't pre-remove `path` — the
@@ -181,18 +196,20 @@ static func _resolve_target_mode(path: String, had_original: bool) -> int:
 	return FileAccess.UNIX_READ_OWNER | FileAccess.UNIX_WRITE_OWNER
 
 
-static func _apply_mode(path: String, mode: int) -> void:
+static func _apply_mode(path: String, mode: int) -> bool:
 	# Best-effort. set_unix_permissions returns ERR_UNAVAILABLE on platforms
 	# without POSIX permissions (Windows); that's expected and ignored so the
 	# write still works there. mode <= 0 should never happen (resolve always
 	# returns >0) but is guarded so a future caller can't chmod a file to nothing.
 	if mode <= 0:
-		return
+		return false
 	var err := FileAccess.set_unix_permissions(path, mode)
+	if err == OK or err == ERR_UNAVAILABLE:
+		return true
 	# Surface a real chmod failure (not the Windows no-op) so permission
 	# hardening on a sensitive config doesn't fail completely silently.
-	if err != OK and err != ERR_UNAVAILABLE:
-		push_warning("MCP | could not set permissions on %s (error %d)" % [path, err])
+	push_warning("MCP | could not set permissions on %s (error %d)" % [path, err])
+	return false
 
 
 static func _written_size_matches(path: String, content: String) -> bool:

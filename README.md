@@ -94,8 +94,10 @@ Kimi Code.
 
 </details>
 
-Server URL is always `http://127.0.0.1:8000/mcp`. If auto-configure can't find
-a CLI, each dock row exposes a **Run this manually** panel with a copyable
+The default server URL is `http://127.0.0.1:8000/mcp`. It can be changed in
+Editor Settings, or per editor process for isolated worktree lanes; see the
+[port and multi-editor guide](docs/port-conflicts.md). If auto-configure can't
+find a CLI, each dock row exposes a **Run this manually** panel with a copyable
 snippet.
 
 ### 4. Try it

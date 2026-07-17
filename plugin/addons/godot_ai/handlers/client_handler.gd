@@ -32,7 +32,7 @@ func remove_client(params: Dictionary) -> Dictionary:
 
 func check_client_status(_params: Dictionary) -> Dictionary:
 	var clients := []
-	for client_id in McpClientConfigurator.client_ids():
+	for client_id in McpClientConfigurator.scoped_client_ids():
 		var status := McpClientConfigurator.check_status(client_id)
 		clients.append({
 			"id": client_id,

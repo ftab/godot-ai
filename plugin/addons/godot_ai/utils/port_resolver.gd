@@ -9,7 +9,18 @@ extends RefCounted
 ## Canonical pid-file path. plugin.gd::SERVER_PID_FILE re-exports this so
 ## external readers and tests can use either name.
 const SERVER_PID_FILE := "user://godot_ai_server.pid"
+const ISOLATED_SERVERS_DIR := "user://godot_ai_servers"
 const WindowsPortReservation := preload("res://addons/godot_ai/utils/windows_port_reservation.gd")
+
+
+## Resolve the PID file for one server endpoint. `lane_http_port == 0` is the
+## legacy single-editor path; an explicit per-process HTTP port gets its own
+## directory so independent editor/server stacks never read or clear each
+## other's PID. Pure/parameterized on purpose: worker threads never read env.
+static func server_pid_file(lane_http_port: int = 0) -> String:
+	if lane_http_port <= 0:
+		return SERVER_PID_FILE
+	return "%s/%d/server.pid" % [ISOLATED_SERVERS_DIR, lane_http_port]
 
 
 static func can_bind_local_port(port: int) -> bool:
@@ -215,10 +226,11 @@ static func split_on_whitespace(s: String) -> PackedStringArray:
 	return out
 
 
-static func read_pid_file() -> int:
-	if not FileAccess.file_exists(SERVER_PID_FILE):
+static func read_pid_file(lane_http_port: int = 0) -> int:
+	var path := server_pid_file(lane_http_port)
+	if not FileAccess.file_exists(path):
 		return 0
-	var f := FileAccess.open(SERVER_PID_FILE, FileAccess.READ)
+	var f := FileAccess.open(path, FileAccess.READ)
 	if f == null:
 		return 0
 	var content := f.get_as_text().strip_edges()
@@ -229,9 +241,10 @@ static func read_pid_file() -> int:
 	return pid if pid > 0 else 0
 
 
-static func clear_pid_file() -> void:
-	if FileAccess.file_exists(SERVER_PID_FILE):
-		DirAccess.remove_absolute(ProjectSettings.globalize_path(SERVER_PID_FILE))
+static func clear_pid_file(lane_http_port: int = 0) -> void:
+	var path := server_pid_file(lane_http_port)
+	if FileAccess.file_exists(path):
+		DirAccess.remove_absolute(ProjectSettings.globalize_path(path))
 
 
 ## `kill -0` returns 0 for both running and zombie processes; Godot

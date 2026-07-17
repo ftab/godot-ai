@@ -26,6 +26,7 @@ class _ProofPlugin extends GodotAiPlugin:
 	var port_in_use_sequence: Array[bool] = []
 	var killed_targets: Array[int] = []
 	var cleared_record_calls := 0
+	var clear_pid_calls := 0
 	var waited_calls := 0
 	var probe_calls := 0
 
@@ -36,6 +37,18 @@ class _ProofPlugin extends GodotAiPlugin:
 
 	func _read_managed_server_record() -> Dictionary:
 		return managed_record.duplicate()
+
+	func _write_managed_server_record(pid: int, version: String) -> bool:
+		managed_record = {
+			"pid": pid,
+			"version": version,
+			"ws_port": _resolved_ws_port,
+			"ws_token": _ws_auth_token,
+		}
+		return true
+
+	func _read_pid_file_for_lifecycle() -> int:
+		return pid_file_pid
 
 	func _read_pid_file_for_proof() -> int:
 		return pid_file_pid
@@ -76,6 +89,11 @@ class _ProofPlugin extends GodotAiPlugin:
 
 	func _clear_managed_server_record() -> void:
 		cleared_record_calls += 1
+		managed_record = {"pid": 0, "version": "", "ws_port": 0, "ws_token": ""}
+
+	func _clear_pid_file_for_lifecycle() -> void:
+		clear_pid_calls += 1
+		pid_file_pid = 0
 
 
 ## #745 crash-survivor tests: like _ProofPlugin, but also stubs
@@ -97,6 +115,18 @@ const TEST_PORT := 65432
 
 func suite_name() -> String:
 	return "plugin_lifecycle"
+
+
+func suite_setup(_ctx: Dictionary) -> void:
+	if McpClientConfigurator.isolated_lane_requested():
+		## These legacy characterization tests intentionally exercise the
+		## default EditorSettings record and default pid-file. Running them
+		## inside a live env lane would overwrite that editor's real ownership
+		## token/PID. Default-port CI covers the suite; lane runs skip it as one
+		## explicit precondition until the fixtures use an injected store.
+		skip_suite(
+			"legacy lifecycle storage tests are isolated from a live env-port lane"
+		)
 
 
 func setup() -> void:
@@ -353,6 +383,33 @@ func test_commandline_fingerprint_is_case_insensitive_and_requires_flag() -> voi
 	assert_false(
 		GodotAiPlugin._commandline_is_godot_ai_server(""),
 		"empty cmdline (lookup failure) must never be accepted as proof"
+	)
+
+
+func test_commandline_lane_fingerprint_rejects_another_branded_lane() -> void:
+	var lane_a := (
+		"/venv/python -m godot_ai --transport streamable-http "
+		+ "--port 18101 --ws-port 19601 --pid-file /tmp/a/server.pid"
+	)
+	var lane_b := (
+		"/venv/python -m godot_ai --transport streamable-http "
+		+ "--port 18102 --ws-port 19602 --pid-file /tmp/b/server.pid"
+	)
+	assert_true(
+		GodotAiPlugin._commandline_matches_server_lane(lane_a, 18101, 19601),
+		"the exact lane launch flags should prove ownership",
+	)
+	assert_false(
+		GodotAiPlugin._commandline_matches_server_lane(lane_b, 18101, 19601),
+		"another godot-ai lane is branded but must not prove ownership",
+	)
+	assert_false(
+		GodotAiPlugin._commandline_matches_server_lane(
+			"/venv/python -m godot_ai --transport streamable-http --port 18101",
+			18101,
+			19601,
+		),
+		"both HTTP and WS launch flags are required",
 	)
 
 

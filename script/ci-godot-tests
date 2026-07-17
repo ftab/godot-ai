@@ -5,7 +5,7 @@
 set -euo pipefail
 source "$(dirname "$0")/_ci_env.sh"
 
-SERVER_URL="http://127.0.0.1:8000/mcp"
+SERVER_URL="${SERVER_URL:-http://127.0.0.1:8000/mcp}"
 HEADERS=(-H "Content-Type: application/json" -H "Accept: application/json, text/event-stream")
 
 # Wait for Godot plugin to connect (session_manage(op="list") returns count > 0)

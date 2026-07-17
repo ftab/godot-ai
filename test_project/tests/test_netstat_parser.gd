@@ -188,6 +188,8 @@ func test_powershell_listener_output_empty_means_no_listener() -> void:
 # ----- pid-file round trip -----
 
 func test_read_pid_file_missing_returns_zero() -> void:
+	if _skip_pid_file_round_trip_in_live_lane():
+		return
 	if FileAccess.file_exists(GodotAiPlugin.SERVER_PID_FILE):
 		## Start from a known-empty state; some earlier test may have
 		## left it behind.
@@ -196,6 +198,8 @@ func test_read_pid_file_missing_returns_zero() -> void:
 
 
 func test_read_pid_file_round_trip() -> void:
+	if _skip_pid_file_round_trip_in_live_lane():
+		return
 	var f := FileAccess.open(GodotAiPlugin.SERVER_PID_FILE, FileAccess.WRITE)
 	assert_true(f != null, "should be able to write to user://")
 	f.store_string("12345\n")
@@ -206,6 +210,8 @@ func test_read_pid_file_round_trip() -> void:
 
 
 func test_read_pid_file_rejects_non_integer() -> void:
+	if _skip_pid_file_round_trip_in_live_lane():
+		return
 	var f := FileAccess.open(GodotAiPlugin.SERVER_PID_FILE, FileAccess.WRITE)
 	f.store_string("not-a-pid")
 	f.close()
@@ -214,6 +220,8 @@ func test_read_pid_file_rejects_non_integer() -> void:
 
 
 func test_read_pid_file_rejects_negative() -> void:
+	if _skip_pid_file_round_trip_in_live_lane():
+		return
 	var f := FileAccess.open(GodotAiPlugin.SERVER_PID_FILE, FileAccess.WRITE)
 	f.store_string("-5")
 	f.close()
@@ -222,8 +230,17 @@ func test_read_pid_file_rejects_negative() -> void:
 
 
 func test_read_pid_file_tolerates_whitespace() -> void:
+	if _skip_pid_file_round_trip_in_live_lane():
+		return
 	var f := FileAccess.open(GodotAiPlugin.SERVER_PID_FILE, FileAccess.WRITE)
 	f.store_string("  98765  \n")
 	f.close()
 	assert_eq(GodotAiPlugin._read_pid_file(), 98765)
 	GodotAiPlugin._clear_pid_file()
+
+
+func _skip_pid_file_round_trip_in_live_lane() -> bool:
+	if not McpClientConfigurator.isolated_lane_requested():
+		return false
+	skip("default pid-file characterization must not mutate a live env lane")
+	return true

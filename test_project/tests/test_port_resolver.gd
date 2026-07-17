@@ -122,6 +122,61 @@ func test_read_pid_file_round_trips_value() -> void:
 	assert_eq(McpPortResolver.read_pid_file(), 0)
 
 
+func test_server_pid_file_namespaces_isolated_http_ports() -> void:
+	assert_eq(McpPortResolver.server_pid_file(), McpPortResolver.SERVER_PID_FILE)
+	assert_eq(
+		McpPortResolver.server_pid_file(18421),
+		"user://godot_ai_servers/18421/server.pid",
+	)
+	assert_true(
+		McpPortResolver.server_pid_file(18421) != McpPortResolver.server_pid_file(18422),
+		"distinct HTTP endpoints must never share lifecycle PID state",
+	)
+
+
+func test_isolated_pid_file_round_trip_does_not_touch_default() -> void:
+	var reserved := _reserve_unused_lane_namespace()
+	var lane_port := int(reserved.get("port", 0))
+	var reservation: TCPServer = reserved.get("server")
+	if lane_port <= 0 or reservation == null:
+		skip("could not reserve an unused isolated-lane namespace")
+		return
+	var path := McpPortResolver.server_pid_file(lane_port)
+	var absolute_path := ProjectSettings.globalize_path(path)
+	DirAccess.make_dir_recursive_absolute(absolute_path.get_base_dir())
+
+	var file := FileAccess.open(path, FileAccess.WRITE)
+	assert_true(file != null, "test setup: isolated pid path should be writable")
+	if file == null:
+		reservation.stop()
+		return
+	file.store_string("54321")
+	file.close()
+	assert_eq(McpPortResolver.read_pid_file(lane_port), 54321)
+	McpPortResolver.clear_pid_file(lane_port)
+	assert_eq(McpPortResolver.read_pid_file(lane_port), 0)
+	reservation.stop()
+
+
+func _reserve_unused_lane_namespace() -> Dictionary:
+	var start := 32000 + (OS.get_process_id() % 18000)
+	for offset in range(2048):
+		var candidate := 30000 + ((start - 30000 + offset) % 30000)
+		var lane_dir := ProjectSettings.globalize_path(
+			"user://godot_ai_servers/%d" % candidate
+		)
+		if (
+			FileAccess.file_exists(lane_dir.path_join("managed.json"))
+			or FileAccess.file_exists(lane_dir.path_join("managed.json.backup"))
+			or FileAccess.file_exists(lane_dir.path_join("server.pid"))
+		):
+			continue
+		var reservation := TCPServer.new()
+		if reservation.listen(candidate, "127.0.0.1") == OK:
+			return {"port": candidate, "server": reservation}
+	return {}
+
+
 func test_windows_powershell_candidates_prefers_system32_path() -> void:
 	## System32 must come first so a hijacked PATH can't intercept.
 	var candidates := McpPortResolver.windows_powershell_candidates()

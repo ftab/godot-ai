@@ -29,14 +29,19 @@ const PortResolver := preload("res://addons/godot_ai/utils/port_resolver.gd")
 
 const SERVER_NAME := "godot-ai"
 
-## Fallback ports. Live port selection goes through `http_port()` / `ws_port()`,
-## which read overrides from EditorSettings first. Users on Windows whose 8000
-## is grabbed by Hyper-V / WSL2 / Docker can pick a different port in
-## Editor Settings > Plugins > godot_ai without touching code. See #146 for
-## the Windows-reservation diagnostics this is the escape hatch for.
+## Fallback ports. Live port selection goes through `http_port()` / `ws_port()`.
+## A complete per-process env pair takes precedence over EditorSettings.
+## Users on Windows whose 8000 is grabbed by Hyper-V / WSL2 / Docker can pick
+## a different port in Editor Settings > Plugins > godot_ai without touching
+## code. See #146 for the Windows-reservation diagnostics this escapes.
 const DEFAULT_HTTP_PORT := 8000
 const DEFAULT_WS_PORT := 9500
 const STARTUP_TRACE_ENV := "GODOT_AI_STARTUP_TRACE"
+const HTTP_PORT_ENV := "GODOT_AI_HTTP_PORT"
+const WS_PORT_ENV := "GODOT_AI_WS_PORT"
+const CLIENT_ID_ENV := "GODOT_AI_CLIENT_ID"
+const CLIENT_IDS_ENV := "GODOT_AI_CLIENT_IDS"
+const AGENT_NAME_ENV := "GODOT_AI_AGENT_NAME"
 const MIN_PORT := 1024
 const MAX_PORT := 65535
 ## Cap on `can_bind_local_port` probes per `suggest_free_port` call so a
@@ -49,18 +54,122 @@ const SETTING_STARTUP_TRACE := "godot_ai/log_startup_timing"
 const _DISCOVERY_TIMEOUT_MS := 3000
 
 
-## Active HTTP port: user override (if in range) or `DEFAULT_HTTP_PORT`.
+## Active HTTP port: per-process env override, user override (if in range),
+## or `DEFAULT_HTTP_PORT`. The env seam lets separate editor processes use
+## independent server stacks even though EditorSettings is shared by every
+## Godot editor process on the machine.
 static func http_port() -> int:
-	return _read_port_setting(McpSettings.SETTING_HTTP_PORT, DEFAULT_HTTP_PORT)
+	return _read_env_or_port_setting(HTTP_PORT_ENV, McpSettings.SETTING_HTTP_PORT, DEFAULT_HTTP_PORT)
 
 
-## Active WebSocket port: user override (if in range) or `DEFAULT_WS_PORT`.
+## Active WebSocket port: per-process env override, user override (if in
+## range), or `DEFAULT_WS_PORT`.
 static func ws_port() -> int:
-	return _read_port_setting(SETTING_WS_PORT, DEFAULT_WS_PORT)
+	return _read_env_or_port_setting(WS_PORT_ENV, SETTING_WS_PORT, DEFAULT_WS_PORT)
 
 
 static func http_url() -> String:
 	return "http://127.0.0.1:%d/mcp" % http_port()
+
+
+## True when this process attempted to opt into an isolated endpoint. A
+## partially specified or malformed pair still counts as requested so it can
+## fail closed instead of silently falling back to the shared default lane.
+static func isolated_lane_requested() -> bool:
+	return (
+		not _raw_env(HTTP_PORT_ENV).is_empty()
+		or not _raw_env(WS_PORT_ENV).is_empty()
+	)
+
+
+## Empty for the normal EditorSettings lane or a complete, distinct env pair.
+## Once either variable is supplied, both are mandatory: mixing one env port
+## with one machine-global EditorSetting would recreate the collision this
+## isolation seam exists to prevent.
+static func isolated_lane_validation_error() -> String:
+	var raw_http := _raw_env(HTTP_PORT_ENV)
+	var raw_ws := _raw_env(WS_PORT_ENV)
+	if raw_http.is_empty() and raw_ws.is_empty():
+		return ""
+	if raw_http.is_empty() or raw_ws.is_empty():
+		return (
+			"Isolated Godot AI lanes require both GODOT_AI_HTTP_PORT and "
+			+ "GODOT_AI_WS_PORT. Set a distinct valid pair and relaunch Godot."
+		)
+	var env_http := _parse_env_port(raw_http)
+	var env_ws := _parse_env_port(raw_ws)
+	if env_http <= 0:
+		return (
+			"GODOT_AI_HTTP_PORT must be an integer from %d to %d; got %s. "
+			+ "Fix the value and relaunch Godot."
+		) % [MIN_PORT, MAX_PORT, raw_http]
+	if env_ws <= 0:
+		return (
+			"GODOT_AI_WS_PORT must be an integer from %d to %d; got %s. "
+			+ "Fix the value and relaunch Godot."
+		) % [MIN_PORT, MAX_PORT, raw_ws]
+	if env_http == env_ws:
+		return (
+			"GODOT_AI_HTTP_PORT and GODOT_AI_WS_PORT must be different; "
+			+ "both resolve to %d. Choose a distinct pair and relaunch Godot."
+		) % env_http
+	return ""
+
+
+## Non-zero only when this process explicitly opted into an isolated endpoint
+## with GODOT_AI_HTTP_PORT. The HTTP port is a sufficient live-lane key: two
+## servers cannot own the same loopback listener at once. Regular users who
+## only changed EditorSettings stay on the legacy ownership-record paths.
+static func isolated_lane_http_port() -> int:
+	if not isolated_lane_validation_error().is_empty():
+		return 0
+	return _read_env_port(HTTP_PORT_ENV)
+
+
+## Per-lane server PID path. The default/single-editor path stays byte-for-byte
+## compatible; isolated endpoint processes get a path keyed by HTTP port.
+static func server_pid_file() -> String:
+	return PortResolver.server_pid_file(isolated_lane_http_port())
+
+
+## Per-lane managed record. Runtime ownership is process state, not a user
+## preference, so isolated editors keep it out of the process-global
+## EditorSettings file. Empty means the legacy EditorSettings record.
+static func managed_server_record_file() -> String:
+	var lane_port := isolated_lane_http_port()
+	if lane_port <= 0:
+		return ""
+	return "user://godot_ai_servers/%d/managed.json" % lane_port
+
+
+static func _read_env_or_port_setting(env_key: String, setting_key: String, default_port: int) -> int:
+	## A requested lane never falls through to shared EditorSettings. Invalid
+	## or incomplete input resolves to port 0; startup validation turns that
+	## into a terminal, actionable diagnosis before lifecycle state is read.
+	if isolated_lane_requested():
+		return _read_env_port(env_key)
+	return _read_port_setting(setting_key, default_port)
+
+
+static func _read_env_port(env_key: String) -> int:
+	## McpPathTemplate owns the mutex-protected environment snapshot. Some
+	## callers run on startup/status worker threads while the main thread
+	## temporarily mutates process env around OS.create_process (#691), so a
+	## direct OS.get_environment here would reintroduce that crash race.
+	return _parse_env_port(_raw_env(env_key))
+
+
+static func _raw_env(env_key: String) -> String:
+	return McpPathTemplate.env_lookup(env_key).strip_edges()
+
+
+static func _parse_env_port(raw: String) -> int:
+	if not raw.is_valid_int():
+		return 0
+	var value := int(raw)
+	if value < MIN_PORT or value > MAX_PORT:
+		return 0
+	return value
 
 
 static func _read_port_setting(key: String, default_port: int) -> int:
@@ -230,6 +339,81 @@ static func suggest_free_port(start: int, span: int = 2048) -> int:
 
 static func client_ids() -> PackedStringArray:
 	return ClientRegistry.ids()
+
+
+## Client rows/actions belonging to this editor process. Normal installs keep
+## the historical all-client view. Isolated agent lanes can set one explicit
+## ID (`GODOT_AI_CLIENT_ID=codex`) or a comma/semicolon-separated set via
+## GODOT_AI_CLIENT_IDS so one editor does not mark another lane's config stale.
+##
+## This scopes dock/status behavior only. Two instances of the same client
+## still need distinct config homes (for example CODEX_HOME) or distinct
+## manually configured MCP entries.
+static func scoped_client_ids() -> PackedStringArray:
+	var env_scope := _client_ids_from_scope_env()
+	if bool(env_scope.get("set", false)):
+		return env_scope.get("ids", PackedStringArray())
+
+	var agent_match := _match_client_selector(McpPathTemplate.env_lookup(AGENT_NAME_ENV))
+	if not agent_match.is_empty():
+		var inferred := PackedStringArray()
+		inferred.append(agent_match)
+		return inferred
+
+	return client_ids()
+
+
+static func _client_ids_from_scope_env() -> Dictionary:
+	var raw := McpPathTemplate.env_lookup(CLIENT_IDS_ENV).strip_edges()
+	if raw.is_empty():
+		raw = McpPathTemplate.env_lookup(CLIENT_ID_ENV).strip_edges()
+	if raw.is_empty():
+		return {"set": false, "ids": PackedStringArray()}
+	return {"set": true, "ids": _parse_client_selector_list(raw)}
+
+
+static func _parse_client_selector_list(raw: String) -> PackedStringArray:
+	var out := PackedStringArray()
+	for token in raw.replace(";", ",").split(",", false):
+		var id := _match_client_selector(String(token))
+		if id.is_empty():
+			push_warning(
+				"MCP | ignoring unknown GODOT_AI_CLIENT_ID(S) entry: %s"
+				% String(token).strip_edges()
+			)
+			continue
+		if out.find(id) == -1:
+			out.append(id)
+	return out
+
+
+static func _match_client_selector(raw: String) -> String:
+	var normalized := _normalize_client_selector(raw)
+	if normalized.is_empty():
+		return ""
+	if ClientRegistry.has_id(normalized):
+		return normalized
+	for client in ClientRegistry.all():
+		if _normalize_client_selector(client.display_name) == normalized:
+			return client.id
+	return ""
+
+
+static func _normalize_client_selector(raw: String) -> String:
+	var lower := raw.strip_edges().to_lower()
+	var out := ""
+	var previous_was_sep := false
+	for i in range(lower.length()):
+		var c := lower.unicode_at(i)
+		var alpha := c >= 97 and c <= 122
+		var digit := c >= 48 and c <= 57
+		if alpha or digit:
+			out += lower.substr(i, 1)
+			previous_was_sep = false
+		elif not previous_was_sep:
+			out += "_"
+			previous_was_sep = true
+	return out.trim_prefix("_").trim_suffix("_")
 
 
 static func has_client(id: String) -> bool:

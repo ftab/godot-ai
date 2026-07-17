@@ -95,12 +95,12 @@ func _ready() -> void:
 	## the peer buffer, drop the frame, and surface as an opaque 5s
 	## timeout + reconnect with no error naming the size.
 	_peer.inbound_buffer_size = OUTBOUND_BUFFER_LIMIT_BYTES
+	_hook_editor_signals()
 	if connect_blocked:
 		_log_blocked_notice_once()
 		set_process(false)
 		return
 	_connect_to_server()
-	_hook_editor_signals()
 
 
 func _process(delta: float) -> void:
@@ -235,6 +235,28 @@ func _connect_to_server() -> void:
 	var err := _peer.connect_to_url(_url)
 	if err != OK:
 		log_buffer.log("failed to initiate connection (error %d)" % err)
+
+
+## Resume an intentionally blocked initial connection after the lifecycle
+## manager has resolved this editor's final WS endpoint. Always replace the
+## peer so a stale CONNECTING/OPEN socket can never survive a lane change.
+func resume_connecting() -> void:
+	connect_blocked = false
+	connect_block_reason = ""
+	_blocked_notice_logged = false
+	if not is_inside_tree():
+		return
+	if _connected:
+		disconnect_from_server()
+	else:
+		_clear_on_disconnect()
+	_peer = WebSocketPeer.new()
+	_peer.outbound_buffer_size = OUTBOUND_BUFFER_LIMIT_BYTES
+	_peer.inbound_buffer_size = OUTBOUND_BUFFER_LIMIT_BYTES
+	_reconnect_attempt = 0
+	_reconnect_timer = 0.0
+	set_process(true)
+	_connect_to_server()
 
 
 func _attempt_reconnect() -> void:

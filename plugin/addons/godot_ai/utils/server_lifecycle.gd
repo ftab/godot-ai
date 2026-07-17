@@ -215,6 +215,22 @@ func is_connection_blocked() -> bool:
 	return _connection_blocked
 
 
+## Any terminal startup diagnosis must block the live Connection as well as
+## the lifecycle state. Isolated lanes begin blocked while their async startup
+## walk proves the endpoint; the default lane can also encounter a WS-only
+## collision after its Connection is constructed. Leaving that socket active
+## would let it attach to the process that owns the conflicting WS port.
+func _block_isolated_lane_connection(message: String) -> void:
+	_connection_blocked = true
+	if not message.is_empty():
+		_server_status_message = message
+	if is_instance_valid(_host):
+		_host._block_connection_for_lane_diagnosis(_server_status_message)
+	disarm_version_check()
+	if is_instance_valid(_host):
+		_host._update_process_enabled()
+
+
 # ---- State-machine entry points ---------------------------------------
 
 ## Validated transition. Returns true on success; false (and logs a
@@ -452,7 +468,18 @@ func _set_incompatible_server(live: Dictionary, expected_version: String, port: 
 		)
 		if _async_stale(async_gen):
 			return
-		print("MCP | port %d occupant not recoverable (no ownership proof); suggested free port %d (set godot_ai/http_port)" % [port, int(suggested_result)])
+		var change_target := (
+			"relaunch with GODOT_AI_HTTP_PORT/GODOT_AI_WS_PORT"
+			if ClientConfigurator.isolated_lane_requested()
+			else "set godot_ai/http_port"
+		)
+		print(
+			(
+				"MCP | port %d occupant not recoverable (no ownership proof); "
+				+ "suggested free port %d (%s)"
+			)
+			% [port, int(suggested_result), change_target]
+		)
 	## Second sweep so the dock's recovery affordance reflects the verdict
 	## that just landed.
 	_host._refresh_dock_client_statuses()
@@ -613,20 +640,77 @@ func start_server() -> void:
 
 
 func _start_server_impl(async_gen: int) -> void:
+	var lane_error := ClientConfigurator.isolated_lane_validation_error()
+	if not lane_error.is_empty():
+		## Fail closed before touching a port, PID file, or managed record.
+		## A typoed lane must never adopt/stop the default editor's server.
+		_startup_path = McpStartupPathScript.CRASHED
+		_server_status_message = lane_error
+		_connection_blocked = true
+		_conflict_port = 0
+		set_terminal_diagnosis(McpServerStateScript.CRASHED)
+		disarm_version_check()
+		_host._update_process_enabled()
+		if _host._log_buffer != null:
+			_host._log_buffer.log(lane_error)
+		push_warning("MCP | %s" % lane_error)
+		return
+
+	var port := ClientConfigurator.http_port()
+	var ws_port := ClientConfigurator.ws_port()
+	var current_version := _expected_server_version()
+	_server_expected_version = current_version
+
 	if _host._server_started_this_session:
 		## Static flag persists across disable/enable cycles in one editor
 		## session — re-entrant spawn guard for plugin-reload-during-update.
+		##
+		## The flag alone is not endpoint proof: failure paths also set it to
+		## suppress duplicate spawns. An isolated lane therefore re-probes its
+		## unique HTTP endpoint and only becomes connectable when the reported
+		## version + effective WS port match this lane. This preserves the
+		## default guard semantics while preventing a guarded lane from
+		## attaching to some other editor's WS listener.
+		if ClientConfigurator.isolated_lane_requested():
+			var guarded_expected_ws := int(_host._resolved_ws_port)
+			var guarded_live_result: Variant = await _run_blocking(func() -> Variant:
+				if not is_instance_valid(_host):
+					return {}
+				return _host._probe_live_server_status_for_port(port)
+			)
+			if _async_stale(async_gen):
+				return
+			var guarded_live: Dictionary = guarded_live_result
+			var guarded_live_version := str(_host._verified_status_version(guarded_live))
+			var guarded_live_ws := int(_host._verified_status_ws_port(guarded_live))
+			var guarded_compatibility := _server_status_compatibility(
+				guarded_live_version,
+				current_version,
+				guarded_live_ws,
+				guarded_expected_ws,
+			)
+			if bool(guarded_compatibility.get("compatible", false)):
+				_server_actual_name = "godot-ai"
+				_server_actual_version = guarded_live_version
+				_host._set_resolved_ws_port(guarded_live_ws)
+				_server_pid = int(_host._find_managed_pid(port))
+				_startup_path = McpStartupPathScript.GUARDED
+				transition_state(McpServerStateScript.READY)
+				_host._resume_connection_after_lane_start()
+				return
+			_startup_path = McpStartupPathScript.GUARDED
+			transition_state(McpServerStateScript.GUARDED)
+			_block_isolated_lane_connection(
+				"Re-entrant server guard could not verify this isolated lane's "
+				+ "HTTP/WS endpoint; reload the editor or relaunch the lane."
+			)
+			return
 		_startup_path = McpStartupPathScript.GUARDED
 		transition_state(McpServerStateScript.GUARDED)
 		return
 
 	_refresh_retried = false
 	_conflict_port = 0
-
-	var port := ClientConfigurator.http_port()
-	var ws_port := ClientConfigurator.ws_port()
-	var current_version := _expected_server_version()
-	_server_expected_version = current_version
 
 	## The worker closures re-check the host: the plugin can be freed while
 	## a bounded shell probe is still running, and the generation check only
@@ -697,6 +781,7 @@ func _start_server_impl(async_gen: int) -> void:
 			_host._server_started_this_session = true
 			_startup_path = McpStartupPathScript.ADOPTED
 			transition_state(McpServerStateScript.READY)
+			_host._resume_connection_after_lane_start()
 			print(_compatible_adoption_log_message(
 				owner_label,
 				int(_server_pid),
@@ -741,6 +826,24 @@ func _start_server_impl(async_gen: int) -> void:
 	_host._set_resolved_ws_port(_host._resolve_ws_port())
 	ws_port = _host._resolved_ws_port
 
+	## The HTTP lane is free, so any existing listener on its resolved WS
+	## port belongs to a different lane/application. Diagnose before spawn
+	## and before unblocking the Connection; otherwise this editor can dial
+	## that listener during the short window before its own child reports
+	## EXIT_PORT_IN_USE.
+	var ws_in_use_result: Variant = await _run_blocking(func() -> Variant:
+		return is_instance_valid(_host) and _host._is_port_in_use(ws_port)
+	)
+	if _async_stale(async_gen):
+		return
+	if bool(ws_in_use_result):
+		_conflict_port = ws_port
+		_server_status_message = _ws_port_in_use_message(ws_port)
+		set_terminal_diagnosis(McpServerStateScript.FOREIGN_PORT)
+		_block_isolated_lane_connection(_server_status_message)
+		push_warning("MCP | %s" % _server_status_message)
+		return
+
 	_host._startup_trace_count("server_command_discovery")
 	## CLI-finder discovery shells out (which/where, login shell) on cache
 	## misses — the same #238/#239 family the dock already runs off-thread.
@@ -753,7 +856,9 @@ func _start_server_impl(async_gen: int) -> void:
 	if server_cmd.is_empty():
 		set_terminal_diagnosis(McpServerStateScript.NO_COMMAND)
 		_startup_path = McpStartupPathScript.NO_COMMAND
-		push_warning("MCP | could not find server command")
+		_server_status_message = "Could not find a godot-ai server command."
+		_block_isolated_lane_connection(_server_status_message)
+		push_warning("MCP | %s" % _server_status_message)
 		return
 
 	var cmd: String = server_cmd[0]
@@ -763,7 +868,7 @@ func _start_server_impl(async_gen: int) -> void:
 
 	## Wipe any stale pid-file so a failed launch can't leave last
 	## session's PID for `_find_managed_pid` to read.
-	_host._clear_pid_file()
+	_host._clear_pid_file_for_lifecycle()
 
 	## Proactive Windows port-reservation check (#146) — bind would
 	## fail silently with WinError 10013 inside a Hyper-V / WSL2 /
@@ -772,7 +877,11 @@ func _start_server_impl(async_gen: int) -> void:
 		_host._server_started_this_session = true
 		set_terminal_diagnosis(McpServerStateScript.PORT_EXCLUDED)
 		_startup_path = McpStartupPathScript.RESERVED
-		push_warning("MCP | port %d is reserved by Windows (Hyper-V / WSL2 / Docker)" % port)
+		_server_status_message = (
+			"Port %d is reserved by Windows (Hyper-V / WSL2 / Docker)." % port
+		)
+		_block_isolated_lane_connection(_server_status_message)
+		push_warning("MCP | %s" % _server_status_message)
 		return
 
 	## ---- Spawn-time env-mutation window (#691) -------------------------
@@ -881,10 +990,13 @@ func _start_server_impl(async_gen: int) -> void:
 		var suffix := " (PYTHONPATH prefix=%s)" % worktree_src if not worktree_src.is_empty() else ""
 		print("MCP | started server (PID %d, v%s): %s %s%s" % [spawned_pid, current_version, cmd, " ".join(args), suffix])
 		_host._start_server_watch()
+		_host._resume_connection_after_lane_start()
 	else:
 		set_terminal_diagnosis(McpServerStateScript.CRASHED)
 		_startup_path = McpStartupPathScript.CRASHED
-		push_warning("MCP | failed to start server")
+		_server_status_message = "Failed to start the godot-ai server process."
+		_block_isolated_lane_connection(_server_status_message)
+		push_warning("MCP | %s" % _server_status_message)
 
 
 ## Watch-loop callback (1 Hz, capped by SERVER_WATCH_MS).
@@ -895,7 +1007,7 @@ func check_server_health() -> void:
 		_host._stop_server_watch()
 		return
 	var elapsed := Time.get_ticks_msec() - int(_server_spawn_ms)
-	var real_pid := PortResolver.read_pid_file()
+	var real_pid: int = int(_host._read_pid_file_for_lifecycle())
 	var spawn_pid := int(_server_pid)
 	if real_pid > 0 and real_pid != spawn_pid and PortResolver.pid_alive(real_pid):
 		_server_pid = real_pid
@@ -915,8 +1027,7 @@ func check_server_health() -> void:
 				_server_status_message = str(conflict.get("message", ""))
 				_conflict_port = int(conflict.get("port", 0))
 				set_terminal_diagnosis(McpServerStateScript.FOREIGN_PORT)
-				disarm_version_check()
-				_host._update_process_enabled()
+				_block_isolated_lane_connection(_server_status_message)
 				_host._log_buffer.log(str(_server_status_message))
 				push_warning("MCP | %s" % _server_status_message)
 				_host._stop_server_watch()
@@ -927,9 +1038,12 @@ func check_server_health() -> void:
 				return
 			_server_exit_ms = elapsed
 			set_terminal_diagnosis(McpServerStateScript.CRASHED)
-			disarm_version_check()
-			_host._update_process_enabled()
-			_host._log_buffer.log("server exited after %dms — see Godot output log" % int(_server_exit_ms))
+			_server_status_message = (
+				"Server exited after %dms — see Godot output log."
+				% int(_server_exit_ms)
+			)
+			_block_isolated_lane_connection(_server_status_message)
+			_host._log_buffer.log(_server_status_message)
 			_host._stop_server_watch()
 		return
 	if elapsed >= int(_host.SERVER_WATCH_MS):
@@ -944,26 +1058,48 @@ func check_server_health() -> void:
 ## identify as godot-ai is deliberately not diagnosed here — that's the
 ## stale-server / adoption territory handled by the next `start_server`
 ## walk, not a foreign conflict.
+static func _ws_port_in_use_message(ws_port: int) -> String:
+	var instruction := (
+		"Stop it or relaunch this editor with a different "
+		+ "GODOT_AI_HTTP_PORT/GODOT_AI_WS_PORT pair."
+		if ClientConfigurator.isolated_lane_requested()
+		else (
+			"Stop it or change the port in Editor Settings "
+			+ "(godot_ai/ws_port)."
+		)
+	)
+	return (
+		"WebSocket port %d is in use by another application. %s"
+		% [ws_port, instruction]
+	)
+
+
 func _diagnose_spawn_port_conflict() -> Dictionary:
 	var http_port := ClientConfigurator.http_port()
 	if bool(_host._is_port_in_use(http_port)):
 		var live: Dictionary = _host._probe_live_server_status_for_port(http_port)
 		if _live_status_identifies_godot_ai(live):
 			return {}
+		var http_instruction := (
+			"Stop it or relaunch this editor with a different "
+			+ "GODOT_AI_HTTP_PORT/GODOT_AI_WS_PORT pair."
+			if ClientConfigurator.isolated_lane_requested()
+			else (
+				"Stop it or change the port in Editor Settings "
+				+ "(godot_ai/http_port)."
+			)
+		)
 		return {
-			"message": (
-				"Port %d is in use by another application. Stop it or change "
-				+ "the port in Editor Settings (godot_ai/http_port)."
-			) % http_port,
+			"message": "Port %d is in use by another application. %s" % [
+				http_port,
+				http_instruction,
+			],
 			"port": http_port,
 		}
 	var ws_port := int(_host._resolved_ws_port)
 	if ws_port > 0 and bool(_host._is_port_in_use(ws_port)):
 		return {
-			"message": (
-				"WebSocket port %d is in use by another application. Stop it "
-				+ "or change the port in Editor Settings (godot_ai/ws_port)."
-			) % ws_port,
+			"message": _ws_port_in_use_message(ws_port),
 			"port": ws_port,
 		}
 	return {}
@@ -980,7 +1116,7 @@ func respawn_with_refresh() -> void:
 	var args: Array[String] = []
 	args.assign(server_cmd.slice(1))
 	args.append_array(_host._build_server_flags(ClientConfigurator.http_port(), int(_host._resolved_ws_port)))
-	_host._clear_pid_file()
+	_host._clear_pid_file_for_lifecycle()
 	_host._log_buffer.log("retrying with --refresh (PyPI index may be stale)")
 	var injected_telemetry_env := _inject_telemetry_env()
 	## Set owner PID for THIS spawn too (don't rely on it lingering from
@@ -1002,14 +1138,15 @@ func respawn_with_refresh() -> void:
 		var current_version := _expected_server_version()
 		_host._set_ws_auth_token(ws_token)
 		_host._write_managed_server_record(spawn_pid, current_version)
+		_host._resume_connection_after_lane_start()
 		print("MCP | retried server (PID %d, v%s): %s %s" % [spawn_pid, current_version, cmd, " ".join(args)])
 	else:
 		## OS.create_process returned -1 on the retry — surface CRASHED
 		## rather than loop. `_refresh_retried` is already true.
 		set_terminal_diagnosis(McpServerStateScript.CRASHED)
-		disarm_version_check()
-		_host._update_process_enabled()
-		_host._log_buffer.log("refresh retry failed to spawn — see Godot output log")
+		_server_status_message = "Refresh retry failed to spawn — see Godot output log."
+		_block_isolated_lane_connection(_server_status_message)
+		_host._log_buffer.log(_server_status_message)
 		_host._stop_server_watch()
 
 
@@ -1030,7 +1167,7 @@ func adopt_compatible_server(record_version: String, current_version: String, ow
 	## token the server would reject.
 	_host._set_ws_auth_token("")
 	_host._clear_managed_server_record()
-	_host._clear_pid_file()
+	_host._clear_pid_file_for_lifecycle()
 	return McpAdoptionLabelScript.EXTERNAL
 
 
@@ -1102,7 +1239,7 @@ func recover_strong_port_occupant(port: int, wait_s: float, pre_kill_live: Dicti
 		return false
 
 	_host._clear_managed_server_record()
-	_host._clear_pid_file()
+	_host._clear_pid_file_for_lifecycle()
 	return true
 
 
@@ -1185,7 +1322,7 @@ func prepare_for_update_reload() -> void:
 	_host._wait_for_port_free(port, 3.0)
 	if not bool(_host._is_port_in_use(port)):
 		_host._clear_managed_server_record()
-		_host._clear_pid_file()
+		_host._clear_pid_file_for_lifecycle()
 
 
 # ---- Recovery click ----------------------------------------------------
@@ -1268,7 +1405,7 @@ func recover_incompatible_server() -> bool:
 
 	UvCacheCleanup.purge_stale_builds()
 	_host._clear_managed_server_record()
-	_host._clear_pid_file()
+	_host._clear_pid_file_for_lifecycle()
 	transition_state(McpServerStateScript.STOPPED)
 	_connection_blocked = false
 	_server_status_message = ""
@@ -1309,7 +1446,7 @@ func reset_for_force_restart() -> void:
 	## follow-up start isn't silently swallowed (#682 review).
 	_invalidate_async_startup()
 	_host._clear_managed_server_record()
-	_host._clear_pid_file()
+	_host._clear_pid_file_for_lifecycle()
 	_host._server_started_this_session = false
 	_server_pid = -1
 	transition_state(McpServerStateScript.UNINITIALIZED)

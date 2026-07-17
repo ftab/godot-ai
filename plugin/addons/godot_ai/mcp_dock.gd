@@ -782,7 +782,7 @@ func _build_ui() -> void:
 	_client_grid.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	clients_scroll.add_child(_client_grid)
 
-	for client_id in ClientConfigurator.client_ids():
+	for client_id in ClientConfigurator.scoped_client_ids():
 		_build_client_row(client_id)
 
 	_build_tools_tab(tabs)
@@ -1062,8 +1062,11 @@ func _update_crash_panel(server_status: Dictionary) -> void:
 	var conflict_port := int(server_status.get("conflict_port", 0))
 	var http_conflict := conflict_port <= 0 or conflict_port == ClientConfigurator.http_port()
 	var port_picker_visible := (
-		state == ServerStateScript.PORT_EXCLUDED
-		or (state == ServerStateScript.FOREIGN_PORT and http_conflict)
+		not ClientConfigurator.isolated_lane_requested()
+		and (
+			state == ServerStateScript.PORT_EXCLUDED
+			or (state == ServerStateScript.FOREIGN_PORT and http_conflict)
+		)
 	)
 	_port_picker_panel.visible = port_picker_visible
 	if port_picker_visible:
@@ -1108,6 +1111,9 @@ static func _crash_body_for_state(state: int, server_status: Dictionary = {}) ->
 				return foreign_message
 			return "Another process is already bound to port %d. Pick a free port or stop the other process." % port
 		ServerStateScript.CRASHED:
+			var crash_message := str(server_status.get("message", ""))
+			if not crash_message.is_empty():
+				return crash_message
 			## Both spawn attempts failed on the uvx tier — almost always
 			## means PyPI hasn't propagated this version yet (~10 min after
 			## publish). `_start_server` already tried `--refresh` once, so
@@ -1133,6 +1139,14 @@ static func _crash_body_for_state(state: int, server_status: Dictionary = {}) ->
 static func _free_port_hint(port: int) -> String:
 	var free_http := ClientConfigurator.suggest_free_port(port + 1)
 	var free_ws := ClientConfigurator.suggest_free_port(ClientConfigurator.ws_port() + 1)
+	if free_ws == free_http:
+		free_ws = ClientConfigurator.suggest_free_port(free_ws + 1)
+	if ClientConfigurator.isolated_lane_requested():
+		return (
+			"Ports %d (HTTP) and %d (WS) are free — relaunch this editor with "
+			+ "`GODOT_AI_HTTP_PORT=%d` and `GODOT_AI_WS_PORT=%d`, then point "
+			+ "this lane's isolated client config at the new HTTP URL."
+		) % [free_http, free_ws, free_http, free_ws]
 	return "Ports %d (HTTP) and %d (WS) are free — set `godot_ai/http_port` and `godot_ai/ws_port` in Editor Settings, then update your client config with the new HTTP port (How to change the port, below)." % [free_http, free_ws]
 
 
@@ -1238,6 +1252,12 @@ func _on_log_logging_enabled_changed(enabled: bool) -> void:
 ## the spinbox value before emitting, so we just write the EditorSetting and
 ## reload the plugin here.
 func _on_port_apply_requested(new_port: int) -> void:
+	if ClientConfigurator.isolated_lane_requested():
+		push_warning(
+			"MCP | this editor uses environment-scoped ports; relaunch it "
+			+ "with updated GODOT_AI_HTTP_PORT and GODOT_AI_WS_PORT values"
+		)
+		return
 	var es := EditorInterface.get_editor_settings()
 	if es != null:
 		es.set_setting(McpSettings.SETTING_HTTP_PORT, new_port)
@@ -1749,6 +1769,10 @@ static func _dev_stop_btn_state(dev_running: bool) -> Dictionary:
 func _on_dev_primary_pressed() -> void:
 	if _plugin == null or _server_restart_in_progress:
 		return
+	var lane_error := ClientConfigurator.isolated_lane_validation_error()
+	if not lane_error.is_empty():
+		push_warning("MCP | %s" % lane_error)
+		return
 	if not _plugin.has_method("force_restart_or_start_dev_server"):
 		return
 	if _plugin.has_method("record_dev_server_toggle"):
@@ -1766,6 +1790,10 @@ func _on_dev_primary_pressed() -> void:
 
 func _on_dev_stop_pressed() -> void:
 	if _plugin == null:
+		return
+	var lane_error := ClientConfigurator.isolated_lane_validation_error()
+	if not lane_error.is_empty():
+		push_warning("MCP | %s" % lane_error)
 		return
 	if _plugin.has_method("stop_dev_server"):
 		_plugin.stop_dev_server()
@@ -1803,6 +1831,16 @@ func _update_dev_section_buttons() -> void:
 	if _plugin == null:
 		return
 	if not (_plugin.has_method("has_managed_server") and _plugin.has_method("is_dev_server_running")):
+		return
+	var lane_error := ClientConfigurator.isolated_lane_validation_error()
+	if not lane_error.is_empty():
+		if _dev_primary_btn != null:
+			_dev_primary_btn.disabled = true
+			_dev_primary_btn.text = "Invalid Server Lane"
+			_dev_primary_btn.tooltip_text = lane_error
+		if _dev_stop_btn != null:
+			_dev_stop_btn.disabled = true
+			_dev_stop_btn.tooltip_text = lane_error
 		return
 	var has_managed: bool = _plugin.has_managed_server()
 	var dev_running: bool = _plugin.is_dev_server_running()

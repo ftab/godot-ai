@@ -9,9 +9,10 @@ const GAME_HELPER_AUTOLOAD_PATH := "res://addons/godot_ai/runtime/game_helper.gd
 ## `logs_read(source="editor")`.
 const EditorLogger := preload("res://addons/godot_ai/runtime/editor_logger.gd")
 
-## EditorSettings keys used to remember which server process the plugin
-## spawned — survives editor restarts, lets a later editor session adopt
-## and manage a server it didn't spawn itself. See #135.
+## Legacy/default-lane EditorSettings keys used to remember which server
+## process the plugin spawned. Explicit per-process port lanes store the same
+## record in a private user:// JSON file instead: EditorSettings is one
+## process-global resource and is not a safe concurrent runtime-state store.
 const MANAGED_SERVER_PID_SETTING := "godot_ai/managed_server_pid"
 const MANAGED_SERVER_VERSION_SETTING := "godot_ai/managed_server_version"
 const MANAGED_SERVER_WS_PORT_SETTING := "godot_ai/managed_server_ws_port"
@@ -47,6 +48,7 @@ const Dock := preload("res://addons/godot_ai/mcp_dock.gd")
 const DebuggerPlugin := preload("res://addons/godot_ai/debugger/mcp_debugger_plugin.gd")
 const ExportPlugin := preload("res://addons/godot_ai/export/mcp_export_plugin.gd")
 const ClientConfigurator := preload("res://addons/godot_ai/client_configurator.gd")
+const AtomicWrite := preload("res://addons/godot_ai/clients/_atomic_write.gd")
 const WindowsPortReservation := preload("res://addons/godot_ai/utils/windows_port_reservation.gd")
 
 ## Handlers — preloaded as consts instead of registered via `class_name` so
@@ -223,6 +225,27 @@ func _enter_tree() -> void:
 	## never race the spawn window's setenv/unsetenv around
 	## OS.create_process.
 	ClientConfigurator.warm_env_snapshot()
+	## `_start_server` suspends on worker-thread probes. Seed an explicit
+	## lane's configured WS port synchronously before the Connection exists,
+	## so the class-static default (9500) can never make a new lane dial a
+	## different editor's server during that suspension window.
+	if (
+		ClientConfigurator.isolated_lane_requested()
+		and ClientConfigurator.isolated_lane_validation_error().is_empty()
+	):
+		var lane_ws_port := ClientConfigurator.ws_port()
+		## A Windows lane may have remapped its configured WS port around an
+		## excluded range. On a re-entrant enable the lifecycle guard can fire
+		## before another resolver pass, so prefer the validated lane record's
+		## effective port when one exists.
+		var lane_record := _read_managed_server_record()
+		var recorded_lane_ws_port := int(lane_record.get("ws_port", 0))
+		if (
+			recorded_lane_ws_port >= ClientConfigurator.MIN_PORT
+			and recorded_lane_ws_port <= ClientConfigurator.MAX_PORT
+		):
+			lane_ws_port = recorded_lane_ws_port
+		_set_resolved_ws_port(lane_ws_port)
 
 	_log_buffer = LogBuffer.new()
 	## Apply the persisted dock "Log" toggle before anything logs through the
@@ -260,10 +283,39 @@ func _enter_tree() -> void:
 	## Pause-depth restore boundary (#712): the dispatcher rebalances any
 	## pause_processing level a crashed handler leaked.
 	_dispatcher.pause_target = _connection
-	_connection.connect_blocked = _lifecycle.is_connection_blocked()
-	_connection.connect_block_reason = _lifecycle.get_status_dict().get("message", "")
+	var startup_state: int = int(_lifecycle.get_state())
+	var startup_connection_ready: bool = (
+		startup_state == ServerStateScript.SPAWNING
+		or startup_state == ServerStateScript.READY
+		## The default lane's re-entrant guard preserves its historical
+		## "dial the already-running shared server" behavior. Isolated guarded
+		## lanes transition to READY only after exact endpoint verification.
+		or (
+			not ClientConfigurator.isolated_lane_requested()
+			and startup_state == ServerStateScript.GUARDED
+		)
+	)
+	var server_start_pending: bool = (
+		not startup_connection_ready
+		and not _lifecycle.is_connection_blocked()
+		and not ServerStateScript.is_terminal_diagnosis(startup_state)
+	)
+	_connection.connect_blocked = (
+		_lifecycle.is_connection_blocked()
+		or server_start_pending
+	)
+	_connection.connect_block_reason = (
+		(
+			"Resolving isolated Godot AI lane before connecting"
+			if ClientConfigurator.isolated_lane_requested()
+			else "Resolving Godot AI server before connecting"
+		)
+		if server_start_pending
+		else _lifecycle.get_status_dict().get("message", "")
+	)
 	if (
-		not _lifecycle.is_connection_blocked()
+		not server_start_pending
+		and not _lifecycle.is_connection_blocked()
 		and not ServerStateScript.is_terminal_diagnosis(_lifecycle.get_state())
 	):
 		_arm_server_version_check()
@@ -1169,8 +1221,18 @@ static func _parse_pid_lines(raw: String) -> Array[int]:
 ## Returns 0 when no server can be identified.
 func _find_managed_pid(port: int) -> int:
 	var pid := _read_pid_file()
-	if pid > 0 and _pid_alive(pid):
+	if (
+		pid > 0
+		and _pid_alive(pid)
+		and _pid_cmdline_is_godot_ai_for_proof(pid)
+	):
 		return pid
+	## An isolated lane must never turn an arbitrary listener scrape into
+	## ownership. Its pid-file plus exact --port/--ws-port command line is
+	## the cross-process proof; otherwise a recycled lane-A PID that now
+	## belongs to lane B could make A track and later kill B.
+	if ClientConfigurator.isolated_lane_requested():
+		return 0
 	return _find_pid_on_port(port)
 
 
@@ -1269,6 +1331,15 @@ func _evaluate_recovery_port_occupant_proof(
 	if not str(proof.get("proof", "")).is_empty():
 		return proof
 
+	## A status response proves only that *some* godot-ai server owns the
+	## HTTP port. In an isolated lane, another checkout can intentionally
+	## share that HTTP number while requesting a different WS port; offering
+	## recovery from status-name evidence would let this editor kill the
+	## other lane. Exact HTTP+WS command-line proof above is the only
+	## recoverable ownership evidence for env-configured lanes.
+	if ClientConfigurator.isolated_lane_requested():
+		return {"proof": "", "pids": []}
+
 	var current_live: Dictionary = live if not live.is_empty() else _probe_live_server_status_for_port(port)
 	if _live_status_identifies_godot_ai(current_live):
 		return {"proof": "status_name", "pids": _find_all_pids_on_port(port)}
@@ -1319,12 +1390,20 @@ func _read_pid_file_for_proof() -> int:
 	return _read_pid_file()
 
 
+func _read_pid_file_for_lifecycle() -> int:
+	return _read_pid_file()
+
+
+func _clear_pid_file_for_lifecycle() -> void:
+	_clear_pid_file()
+
+
 func _pid_alive_for_proof(pid: int) -> bool:
 	return _pid_alive(pid)
 
 
 func _pid_cmdline_is_godot_ai_for_proof(pid: int) -> bool:
-	return _pid_cmdline_is_godot_ai(pid)
+	return _pid_cmdline_matches_active_lane(pid)
 
 
 static func _parse_windows_netstat_pid(stdout: String, port: int) -> int:
@@ -1344,11 +1423,15 @@ static func _split_on_whitespace(s: String) -> PackedStringArray:
 
 
 static func _read_pid_file() -> int:
-	return PortResolver.read_pid_file()
+	if not ClientConfigurator.isolated_lane_validation_error().is_empty():
+		return 0
+	return PortResolver.read_pid_file(ClientConfigurator.isolated_lane_http_port())
 
 
 static func _clear_pid_file() -> void:
-	PortResolver.clear_pid_file()
+	if not ClientConfigurator.isolated_lane_validation_error().is_empty():
+		return
+	PortResolver.clear_pid_file(ClientConfigurator.isolated_lane_http_port())
 
 
 func _stop_server() -> void:
@@ -1378,7 +1461,7 @@ static func _build_server_flags(port: int, ws_port: int) -> Array[String]:
 		"--transport", "streamable-http",
 		"--port", str(port),
 		"--ws-port", str(ws_port),
-		"--pid-file", ProjectSettings.globalize_path(SERVER_PID_FILE),
+		"--pid-file", ProjectSettings.globalize_path(ClientConfigurator.server_pid_file()),
 	])
 	## Append `--exclude-domains` only when the user has actually picked at
 	## least one domain to drop. Skipping the empty case keeps spawns
@@ -1425,6 +1508,79 @@ func _pid_cmdline_is_godot_ai(pid: int) -> bool:
 			return true
 		current = _pid_parent(current)
 	return false
+
+
+## Stronger ownership proof for an explicit multi-editor lane. A generic
+## godot-ai brand is insufficient because every lane has that brand; require
+## one ancestor to carry this process's exact HTTP and WS launch flags. The
+## default EditorSettings lane keeps the historical brand-only behavior for
+## upgrade/adoption compatibility.
+func _pid_cmdline_matches_active_lane(pid: int) -> bool:
+	if not ClientConfigurator.isolated_lane_requested():
+		return _pid_cmdline_is_godot_ai(pid)
+	if not ClientConfigurator.isolated_lane_validation_error().is_empty():
+		return false
+	var expected_http := ClientConfigurator.http_port()
+	var expected_ws := _active_lane_ws_port_for_proof()
+	var current := pid
+	for _i in range(5):
+		if current <= 1:
+			return false
+		var cmd := ""
+		if OS.get_name() == "Windows":
+			cmd = _windows_pid_commandline(current)
+		else:
+			cmd = _posix_pid_commandline(current)
+		if _commandline_matches_server_lane(cmd, expected_http, expected_ws):
+			return true
+		current = _pid_parent(current)
+	return false
+
+
+func _active_lane_ws_port_for_proof() -> int:
+	## Windows can remap an excluded configured WS port before spawn. Prefer
+	## the persisted actual port across editor restarts, then the live static
+	## resolved value in this process, and only then the raw env value.
+	var record := _read_managed_server_record()
+	var recorded_ws := int(record.get("ws_port", 0))
+	if (
+		recorded_ws >= ClientConfigurator.MIN_PORT
+		and recorded_ws <= ClientConfigurator.MAX_PORT
+	):
+		return recorded_ws
+	var configured_ws := ClientConfigurator.ws_port()
+	var resolved_ws := int(_resolved_ws_port)
+	if (
+		resolved_ws >= ClientConfigurator.MIN_PORT
+		and resolved_ws <= ClientConfigurator.MAX_PORT
+		and (
+			resolved_ws != ClientConfigurator.DEFAULT_WS_PORT
+			or configured_ws == ClientConfigurator.DEFAULT_WS_PORT
+		)
+	):
+		return resolved_ws
+	return configured_ws
+
+
+static func _commandline_matches_server_lane(cmd: String, http_port: int, ws_port: int) -> bool:
+	return (
+		_commandline_is_godot_ai_server(cmd)
+		and _commandline_has_numeric_flag(cmd, "--port", http_port)
+		and _commandline_has_numeric_flag(cmd, "--ws-port", ws_port)
+	)
+
+
+static func _commandline_has_numeric_flag(cmd: String, flag: String, value: int) -> bool:
+	if cmd.is_empty() or value <= 0:
+		return false
+	var rx := RegEx.new()
+	var pattern := (
+		"(^|\\s)%s(?:=|\\s+)%d(?:\\s|$)"
+		% [flag.replace("-", "\\-"), value]
+	)
+	if rx.compile(pattern) != OK:
+		return false
+	return rx.search(cmd.to_lower()) != null
 
 
 func _pid_parent(pid: int) -> int:
@@ -1550,9 +1706,17 @@ func _wait_for_port_free(port: int, timeout_s: float) -> void:
 
 
 func _read_managed_server_record() -> Dictionary:
+	## Invalid explicit lane input must never fall through to the legacy
+	## machine-global EditorSettings record.
+	if not ClientConfigurator.isolated_lane_validation_error().is_empty():
+		return _empty_managed_server_record()
+	var lane_path := ClientConfigurator.managed_server_record_file()
+	if not lane_path.is_empty():
+		return _read_lane_managed_server_record(lane_path)
+
 	var es := EditorInterface.get_editor_settings()
 	if es == null:
-		return {"pid": 0, "version": "", "ws_port": 0, "ws_token": ""}
+		return _empty_managed_server_record()
 	var pid: int = 0
 	if es.has_setting(MANAGED_SERVER_PID_SETTING):
 		pid = int(es.get_setting(MANAGED_SERVER_PID_SETTING))
@@ -1568,14 +1732,124 @@ func _read_managed_server_record() -> Dictionary:
 	return {"pid": pid, "version": version, "ws_port": ws_port, "ws_token": ws_token}
 
 
-func _write_managed_server_record(pid: int, version: String) -> void:
+func _write_managed_server_record(pid: int, version: String) -> bool:
+	if not ClientConfigurator.isolated_lane_validation_error().is_empty():
+		return false
+	var lane_path := ClientConfigurator.managed_server_record_file()
+	if not lane_path.is_empty():
+		return _write_lane_managed_server_record(lane_path, pid, version)
+
 	var es := EditorInterface.get_editor_settings()
 	if es == null:
-		return
+		return false
 	es.set_setting(MANAGED_SERVER_PID_SETTING, pid)
 	es.set_setting(MANAGED_SERVER_VERSION_SETTING, version)
 	es.set_setting(MANAGED_SERVER_WS_PORT_SETTING, _resolved_ws_port)
 	es.set_setting(MANAGED_SERVER_WS_TOKEN_SETTING, _ws_auth_token)
+	return true
+
+
+static func _empty_managed_server_record() -> Dictionary:
+	return {"pid": 0, "version": "", "ws_port": 0, "ws_token": ""}
+
+
+func _read_lane_managed_server_record(path: String) -> Dictionary:
+	if not FileAccess.file_exists(path):
+		return _empty_managed_server_record()
+	var file := FileAccess.open(path, FileAccess.READ)
+	if file == null:
+		push_warning("MCP | could not read isolated server record: %s" % path)
+		return _empty_managed_server_record()
+	var parsed: Variant = JSON.parse_string(file.get_as_text())
+	file.close()
+	if not parsed is Dictionary:
+		push_warning("MCP | ignoring malformed isolated server record: %s" % path)
+		return _empty_managed_server_record()
+	var record: Dictionary = parsed
+	var expected_http_port := ClientConfigurator.http_port()
+	var expected_configured_ws_port := ClientConfigurator.ws_port()
+	if (
+		not _json_integer_in_range(record.get("schema_version"), 2, 2)
+		or not _json_integer_in_range(
+			record.get("http_port"),
+			ClientConfigurator.MIN_PORT,
+			ClientConfigurator.MAX_PORT,
+		)
+		or int(record.get("http_port")) != expected_http_port
+		or not _json_integer_in_range(
+			record.get("configured_ws_port"),
+			ClientConfigurator.MIN_PORT,
+			ClientConfigurator.MAX_PORT,
+		)
+		or int(record.get("configured_ws_port")) != expected_configured_ws_port
+		or not _json_integer_in_range(record.get("pid"), 1, 2147483647)
+		or not _json_integer_in_range(
+			record.get("ws_port"),
+			ClientConfigurator.MIN_PORT,
+			ClientConfigurator.MAX_PORT,
+		)
+		or typeof(record.get("version")) != TYPE_STRING
+		or typeof(record.get("ws_token")) != TYPE_STRING
+	):
+		push_warning("MCP | ignoring invalid isolated server record: %s" % path)
+		return _empty_managed_server_record()
+	return {
+		"pid": int(record.get("pid")),
+		"version": record.get("version"),
+		"ws_port": int(record.get("ws_port")),
+		"ws_token": record.get("ws_token"),
+	}
+
+
+static func _json_integer_in_range(value: Variant, minimum: int, maximum: int) -> bool:
+	var value_type := typeof(value)
+	if value_type != TYPE_INT and value_type != TYPE_FLOAT:
+		return false
+	var number := float(value)
+	return (
+		is_finite(number)
+		and number == floor(number)
+		and number >= float(minimum)
+		and number <= float(maximum)
+	)
+
+
+func _write_lane_managed_server_record(path: String, pid: int, version: String) -> bool:
+	var record := {
+		"schema_version": 2,
+		"http_port": ClientConfigurator.http_port(),
+		"configured_ws_port": ClientConfigurator.ws_port(),
+		"ws_port": _resolved_ws_port,
+		"pid": pid,
+		"version": version,
+		"ws_token": _ws_auth_token,
+	}
+	var absolute_path := ProjectSettings.globalize_path(path)
+	if not AtomicWrite.write(absolute_path, JSON.stringify(record)):
+		push_warning("MCP | could not persist isolated server record: %s" % path)
+		## Never leave the prior PID/token record looking authoritative for
+		## the newly spawned server. The in-memory token remains valid for
+		## this editor session; a later editor will safely treat the running
+		## server as external instead of presenting a stale wrong token.
+		_remove_lane_managed_server_record_files(absolute_path)
+		return false
+	## McpAtomicWrite keeps a one-shot backup for user-authored config files.
+	## This record is ephemeral runtime state and contains the WS token, so a
+	## successful verified commit removes the now-obsolete backup immediately.
+	var backup_path := absolute_path + ".backup"
+	if FileAccess.file_exists(backup_path):
+		DirAccess.remove_absolute(backup_path)
+	return true
+
+
+static func _remove_lane_managed_server_record_files(absolute_path: String) -> void:
+	for candidate in [
+		absolute_path,
+		absolute_path + ".backup",
+		"%s.tmp.%d" % [absolute_path, OS.get_process_id()],
+	]:
+		if FileAccess.file_exists(candidate):
+			DirAccess.remove_absolute(candidate)
 
 
 ## Keep the in-memory token, the connection's handshake field, and (via the
@@ -1595,6 +1869,14 @@ func _clear_managed_server_record() -> void:
 	## es == null early return on purpose: the in-memory scrub must not
 	## depend on EditorSettings being available.)
 	_set_ws_auth_token("")
+	if not ClientConfigurator.isolated_lane_validation_error().is_empty():
+		return
+	var lane_path := ClientConfigurator.managed_server_record_file()
+	if not lane_path.is_empty():
+		var absolute_path := ProjectSettings.globalize_path(lane_path)
+		_remove_lane_managed_server_record_files(absolute_path)
+		return
+
 	var es := EditorInterface.get_editor_settings()
 	if es == null:
 		return
@@ -1677,13 +1959,62 @@ func _resume_connection_after_recovery() -> void:
 			state != ServerStateScript.SPAWNING
 			and state != ServerStateScript.READY
 		)
-	):
+		):
 		return
 	_connection.connect_blocked = false
 	_connection.connect_block_reason = ""
 	_connection.server_version = ""
 	_connection.set_process(true)
+	_connection.resume_connecting()
 	_arm_server_version_check()
+
+
+func _resume_connection_after_lane_start() -> void:
+	if _connection == null:
+		return
+	var state: int = _lifecycle.get_state()
+	if (
+		_lifecycle.is_connection_blocked()
+		or (
+			state != ServerStateScript.SPAWNING
+			and state != ServerStateScript.READY
+		)
+	):
+		return
+	_connection.ws_port = _resolved_ws_port
+	_connection.server_version = ""
+	_connection.resume_connecting()
+	_arm_server_version_check()
+
+
+## A manual --reload dev-server start is an explicit successful launch
+## boundary, independent of the auto-start state machine. In particular, a
+## lane recovering from NO_COMMAND/CRASHED/PORT_EXCLUDED has a deliberately
+## blocked Connection and a STOPPED lifecycle state after `_stop_server`;
+## waiting for SPAWNING/READY here would strand it forever.
+func _resume_connection_after_explicit_server_start() -> void:
+	if _connection == null:
+		return
+	if not ClientConfigurator.isolated_lane_validation_error().is_empty():
+		return
+	_set_ws_auth_token("")
+	_connection.ws_port = _resolved_ws_port
+	_connection.server_version = ""
+	_connection.resume_connecting()
+	_arm_server_version_check()
+
+
+## Common async-terminal propagation to the live Connection. Isolated lanes
+## start disabled until their pair is resolved; the default lane can already
+## be dialing when a late WS-only collision is diagnosed. In both cases,
+## replace the reason and defensively drop any socket opened during the race.
+func _block_connection_for_lane_diagnosis(message: String) -> void:
+	if _connection == null:
+		return
+	_connection.connect_blocked = true
+	_connection.connect_block_reason = message
+	_connection.disconnect_from_server()
+	_connection.set_process(false)
 
 
 func recover_incompatible_server() -> bool:
@@ -1708,20 +2039,51 @@ func force_restart_server() -> void:
 
 
 ## Single entry point for the dock's primary "Restart Dev Server" button.
-## The user clicking Restart is explicit consent to take over the HTTP port,
-## so this is aggressive: any PID holding the port gets killed (managed,
-## branded-dev, or orphan multiprocessing.spawn workers whose parent died
-## so brand detection misses them). After the port frees we spawn a fresh
-## --reload dev server. Returns true if a kill happened, false if the port
-## was already free and we just spawned.
+## In the default lane, clicking Restart is explicit consent to take over the
+## HTTP port, including orphan multiprocessing.spawn workers whose parent died
+## so brand detection misses them. An isolated lane is stricter: even an
+## explicit click may kill only a process whose command line proves this exact
+## HTTP+WS pair. After the port frees we spawn a fresh --reload dev server.
+## Returns true if a kill happened, false if the port was free (or takeover was
+## refused) before the start attempt.
 func force_restart_or_start_dev_server() -> bool:
+	var lane_error := ClientConfigurator.isolated_lane_validation_error()
+	if not lane_error.is_empty():
+		push_warning("MCP | %s" % lane_error)
+		return false
 	var port := ClientConfigurator.http_port()
 	var killed := false
-	if has_managed_server():
-		_lifecycle.reset_for_force_restart()
-	if _is_port_in_use(port):
-		_kill_processes_and_windows_spawn_children(_find_all_pids_on_port(port))
+	var managed_before_restart := has_managed_server()
+	var port_in_use := _is_port_in_use(port)
+	if port_in_use:
+		var candidates := _find_all_pids_on_port(port)
+		if ClientConfigurator.isolated_lane_requested():
+			var proven_lane_candidates: Array[int] = []
+			for pid in candidates:
+				var candidate := int(pid)
+				if _pid_cmdline_is_godot_ai_for_proof(candidate):
+					proven_lane_candidates.append(candidate)
+			candidates = proven_lane_candidates
+			if candidates.is_empty():
+				var message := (
+					"Port %d belongs to another process or Godot AI lane; "
+					+ "refusing to restart it without exact HTTP/WS ownership proof."
+				) % port
+				_block_connection_for_lane_diagnosis(message)
+				push_warning("MCP | %s" % message)
+				return false
+		## Do not clear HTTP-keyed ownership state until an isolated lane has
+		## proved the current listener is its exact HTTP+WS process. A stale
+		## local _server_pid must not erase another lane's record before the
+		## refusal above.
+		if managed_before_restart:
+			_lifecycle.reset_for_force_restart()
+		_kill_processes_and_windows_spawn_children(candidates)
 		killed = true
+	elif managed_before_restart:
+		## No process owns the endpoint, so stale local ownership state is
+		## safe to discard before the fresh dev-server launch.
+		_lifecycle.reset_for_force_restart()
 	if killed:
 		## OS.kill returns synchronously but uvicorn's listener can take
 		## longer to release the port. Without this wait, start_dev_server's
@@ -1743,6 +2105,10 @@ func start_dev_server() -> void:
 	## On the root repo the path matches the installed package, so this is a
 	## no-op; in a worktree it's what makes `--reload` actually watch the
 	## worktree's Python. See #84.
+	var lane_error := ClientConfigurator.isolated_lane_validation_error()
+	if not lane_error.is_empty():
+		push_warning("MCP | %s" % lane_error)
+		return
 	_stop_server()
 	get_tree().create_timer(0.5).timeout.connect(func():
 		var server_cmd := ClientConfigurator.get_server_command()
@@ -1752,11 +2118,35 @@ func start_dev_server() -> void:
 
 		var cmd: String = server_cmd[0]
 		_set_resolved_ws_port(_resolve_ws_port())
+		var http_port := ClientConfigurator.http_port()
+		if _is_port_in_use(http_port):
+			var http_message := (
+				"Port %d is still in use; refusing to start a dev server on "
+				+ "a contested endpoint."
+			) % http_port
+			_block_connection_for_lane_diagnosis(http_message)
+			push_warning("MCP | %s" % http_message)
+			return
+		if _is_port_in_use(_resolved_ws_port):
+			var ws_message := (
+				"WebSocket port %d is still in use; refusing to start an "
+				+ "dev server on a contested endpoint."
+			) % _resolved_ws_port
+			_block_connection_for_lane_diagnosis(ws_message)
+			push_warning("MCP | %s" % ws_message)
+			return
+		## A --reload dev server is intentionally external/unmanaged. Once
+		## both ports are proven free, discard any stale managed token/PID so
+		## a later plugin reload cannot misclassify this process as the prior
+		## auto-spawned server.
+		_clear_managed_server_record()
+		_clear_pid_file_for_lifecycle()
+		_server_started_this_session = false
 		var inner_args: Array[String] = []
 		inner_args.assign(server_cmd.slice(1))
 		inner_args.append_array([
 			"--transport", "streamable-http",
-			"--port", str(ClientConfigurator.http_port()),
+			"--port", str(http_port),
 			"--ws-port", str(_resolved_ws_port),
 			"--reload",
 		])
@@ -1789,6 +2179,7 @@ func start_dev_server() -> void:
 			## not replaced it. See #429 review.
 			var suffix := " (PYTHONPATH prefix=%s)" % worktree_src if not worktree_src.is_empty() else ""
 			print("MCP | started dev server with --reload (PID %d): %s %s%s" % [pid, cmd, " ".join(inner_args), suffix])
+			_resume_connection_after_explicit_server_start()
 		else:
 			push_warning("MCP | failed to start dev server")
 	)
@@ -1797,6 +2188,10 @@ func start_dev_server() -> void:
 func stop_dev_server() -> void:
 	## Stop any server running on the HTTP port (by port, not PID).
 	## Used for dev servers whose PID we don't track across reloads.
+	var lane_error := ClientConfigurator.isolated_lane_validation_error()
+	if not lane_error.is_empty():
+		push_warning("MCP | %s" % lane_error)
+		return
 	if _lifecycle.get_server_pid() > 0:
 		# We have a managed server — use normal stop
 		_stop_server()
@@ -1809,7 +2204,7 @@ func stop_dev_server() -> void:
 	var candidates: Array[int] = []
 	for pid in _find_all_pids_on_port(port):
 		var candidate := int(pid)
-		if _pid_cmdline_is_godot_ai(candidate):
+		if _pid_cmdline_is_godot_ai_for_proof(candidate):
 			candidates.append(candidate)
 	var killed := _kill_processes_and_windows_spawn_children(candidates)
 	if not killed.is_empty():
@@ -1880,7 +2275,7 @@ func is_dev_server_running() -> bool:
 	if _lifecycle.get_server_pid() > 0:
 		return false
 	for pid in _find_all_pids_on_port(ClientConfigurator.http_port()):
-		if _pid_cmdline_is_godot_ai(int(pid)):
+		if _pid_cmdline_is_godot_ai_for_proof(int(pid)):
 			return true
 	return false
 

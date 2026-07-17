@@ -29,8 +29,13 @@ class _ManagerHostStub extends GodotAiPlugin:
 	var port_in_use_sequence: Array[bool] = []
 	var killed_targets: Array[int] = []
 	var cleared_record_calls := 0
+	var written_record_calls := 0
+	var clear_pid_calls := 0
 	var stop_watch_calls := 0
 	var finalize_calls := 0
+	var resume_lane_calls := 0
+	var resolved_ws_port_value := 0
+	var start_dev_calls := 0
 
 	func _find_all_pids_on_port(_port: int) -> Array[int]:
 		var pids: Array[int] = []
@@ -39,6 +44,19 @@ class _ManagerHostStub extends GodotAiPlugin:
 
 	func _read_managed_server_record() -> Dictionary:
 		return managed_record.duplicate()
+
+	func _write_managed_server_record(pid: int, version: String) -> bool:
+		written_record_calls += 1
+		managed_record = {
+			"pid": pid,
+			"version": version,
+			"ws_port": _resolved_ws_port,
+			"ws_token": _ws_auth_token,
+		}
+		return true
+
+	func _read_pid_file_for_lifecycle() -> int:
+		return pid_file_pid
 
 	func _read_pid_file_for_proof() -> int:
 		return pid_file_pid
@@ -75,6 +93,11 @@ class _ManagerHostStub extends GodotAiPlugin:
 
 	func _clear_managed_server_record() -> void:
 		cleared_record_calls += 1
+		managed_record = {"pid": 0, "version": "", "ws_port": 0, "ws_token": ""}
+
+	func _clear_pid_file_for_lifecycle() -> void:
+		clear_pid_calls += 1
+		pid_file_pid = 0
 
 	func _stop_server_watch() -> void:
 		stop_watch_calls += 1
@@ -85,6 +108,17 @@ class _ManagerHostStub extends GodotAiPlugin:
 
 	func _find_managed_pid(_port: int) -> int:
 		return managed_pid_lookup
+
+	func _resolve_ws_port() -> int:
+		if resolved_ws_port_value > 0:
+			return resolved_ws_port_value
+		return _resolved_ws_port
+
+	func _resume_connection_after_lane_start() -> void:
+		resume_lane_calls += 1
+
+	func start_dev_server() -> void:
+		start_dev_calls += 1
 
 
 const TEST_PORT := 65431
@@ -151,6 +185,58 @@ func test_recover_returns_false_with_no_proof() -> void:
 
 	assert_false(ok)
 	assert_true(killed.is_empty())
+
+
+func test_isolated_lane_recovery_rejects_status_name_only() -> void:
+	if not McpClientConfigurator.isolated_lane_requested():
+		skip("requires an env-configured isolated lane")
+		return
+	var host := _ManagerHostStub.new()
+	host.listener_pids = [13579] as Array[int]
+	host.live_status = {
+		"name": "godot-ai",
+		"version": "3.0.3",
+		"ws_port": McpClientConfigurator.ws_port() + 1,
+		"status_code": 200,
+	}
+
+	var proof := host._evaluate_recovery_port_occupant_proof(
+		McpClientConfigurator.http_port(),
+		host.live_status,
+	)
+	host.free()
+
+	assert_eq(
+		proof.get("proof", ""),
+		"",
+		"status-name evidence must never authorize killing another lane",
+	)
+	var pids: Array[int] = []
+	pids.assign(proof.get("pids", []))
+	assert_true(pids.is_empty())
+
+
+func test_isolated_lane_restart_refuses_unproven_http_occupant() -> void:
+	if not McpClientConfigurator.isolated_lane_requested():
+		skip("requires an env-configured isolated lane")
+		return
+	var host := _ManagerHostStub.new()
+	host.port_in_use = true
+	host.listener_pids = [13579] as Array[int]
+	host._lifecycle._server_pid = 24680
+
+	var killed := host.force_restart_or_start_dev_server()
+	var killed_targets := host.killed_targets.duplicate()
+	var start_calls := host.start_dev_calls
+	var record_clears := host.cleared_record_calls
+	var pid_clears := host.clear_pid_calls
+	host.free()
+
+	assert_false(killed)
+	assert_true(killed_targets.is_empty(), "another lane must not be killed")
+	assert_eq(start_calls, 0, "a contested unproven lane must not start over the owner")
+	assert_eq(record_clears, 0, "refusal must preserve the other lane's ownership record")
+	assert_eq(pid_clears, 0, "refusal must preserve the other lane's PID file")
 
 
 func test_recover_kills_and_clears_when_port_frees() -> void:
@@ -432,7 +518,10 @@ func test_diagnose_spawn_port_conflict_flags_foreign_http_occupant() -> void:
 	var http_port := McpClientConfigurator.http_port()
 	assert_eq(int(conflict.get("port", 0)), http_port)
 	assert_contains(str(conflict.get("message", "")), "Port %d is in use by another application" % http_port)
-	assert_contains(str(conflict.get("message", "")), "godot_ai/http_port")
+	if McpClientConfigurator.isolated_lane_requested():
+		assert_contains(str(conflict.get("message", "")), "GODOT_AI_HTTP_PORT")
+	else:
+		assert_contains(str(conflict.get("message", "")), "godot_ai/http_port")
 
 
 func test_diagnose_spawn_port_conflict_ignores_godot_ai_occupant() -> void:
@@ -463,7 +552,10 @@ func test_diagnose_spawn_port_conflict_flags_foreign_ws_occupant() -> void:
 	assert_has_key(conflict, "message")
 	assert_eq(int(conflict.get("port", 0)), ws_port)
 	assert_contains(str(conflict.get("message", "")), "WebSocket port %d is in use" % ws_port)
-	assert_contains(str(conflict.get("message", "")), "godot_ai/ws_port")
+	if McpClientConfigurator.isolated_lane_requested():
+		assert_contains(str(conflict.get("message", "")), "GODOT_AI_WS_PORT")
+	else:
+		assert_contains(str(conflict.get("message", "")), "godot_ai/ws_port")
 
 
 func test_diagnose_spawn_port_conflict_empty_when_ports_free() -> void:
@@ -489,6 +581,7 @@ func test_status_dict_carries_conflict_port() -> void:
 
 
 func test_start_server_short_circuits_on_static_guard() -> void:
+	var saved_guard := GodotAiPlugin._server_started_this_session
 	GodotAiPlugin._server_started_this_session = true
 	var host := _ManagerHostStub.new()
 	host.port_in_use = true
@@ -500,14 +593,170 @@ func test_start_server_short_circuits_on_static_guard() -> void:
 	var killed := host.killed_targets.duplicate()
 	var state := manager.get_state()
 	host.free()
-	GodotAiPlugin._server_started_this_session = false
+	GodotAiPlugin._server_started_this_session = saved_guard
 
 	assert_eq(path, McpStartupPath.GUARDED)
 	assert_eq(state, McpServerState.GUARDED)
 	assert_true(killed.is_empty())
 
 
+func test_ws_occupied_preflight_prevents_spawn_and_lane_resume() -> void:
+	## The HTTP lane can be free while its requested WebSocket endpoint is
+	## already owned by another editor. The startup walk must diagnose that
+	## endpoint before command discovery / PID-record mutation and, most
+	## importantly, before it tells the pending lane Connection to dial.
+	var saved_guard := GodotAiPlugin._server_started_this_session
+	var saved_ws := int(GodotAiPlugin._resolved_ws_port)
+	GodotAiPlugin._server_started_this_session = false
+	var host := _ManagerHostStub.new()
+	host.resolved_ws_port_value = (
+		McpClientConfigurator.ws_port()
+		if McpClientConfigurator.ws_port() > 0
+		else saved_ws
+	)
+	host.port_in_use_sequence = [false, true] as Array[bool]
+	var conn := McpConnection.new()
+	conn.connect_blocked = true
+	conn.connect_block_reason = "Resolving isolated Godot AI lane before connecting"
+	host._connection = conn
+	var manager := McpServerLifecycleManagerScript.new(host)
+
+	manager.start_server()
+	var state := manager.get_state()
+	var message := str(manager.get_status_dict().get("message", ""))
+	var resume_calls := host.resume_lane_calls
+	var clear_pid_calls := host.clear_pid_calls
+	var connection_reason := conn.connect_block_reason
+	conn.free()
+	host.free()
+	GodotAiPlugin._resolved_ws_port = saved_ws
+	GodotAiPlugin._server_started_this_session = saved_guard
+
+	assert_eq(state, McpServerState.FOREIGN_PORT)
+	assert_eq(resume_calls, 0, "occupied WS preflight must never resume the lane")
+	assert_eq(clear_pid_calls, 0, "preflight must stop before spawn-record preparation")
+	assert_contains(message, "WebSocket port")
+	assert_eq(
+		connection_reason,
+		message,
+		"every WS collision must replace the pending reason and block the socket",
+	)
+
+
+func test_guarded_isolated_lane_requires_verified_http_version_and_ws_match() -> void:
+	if not McpClientConfigurator.isolated_lane_requested():
+		skip("requires an explicit GODOT_AI_HTTP_PORT/GODOT_AI_WS_PORT lane")
+		return
+	var saved_guard := GodotAiPlugin._server_started_this_session
+	var saved_ws := int(GodotAiPlugin._resolved_ws_port)
+	var expected_version := McpClientConfigurator.get_plugin_version()
+	var expected_ws := McpClientConfigurator.ws_port()
+	GodotAiPlugin._server_started_this_session = true
+	GodotAiPlugin._resolved_ws_port = expected_ws
+	var mismatches: Array[Dictionary] = [
+		{
+			"label": "unverified HTTP response",
+			"live": {
+				"name": "",
+				"version": expected_version,
+				"ws_port": expected_ws,
+				"status_code": 200,
+			},
+		},
+		{
+			"label": "version mismatch",
+			"live": {
+				"name": "godot-ai",
+				"version": expected_version + "-other",
+				"ws_port": expected_ws,
+				"status_code": 200,
+			},
+		},
+		{
+			"label": "WebSocket mismatch",
+			"live": {
+				"name": "godot-ai",
+				"version": expected_version,
+				"ws_port": expected_ws + 1,
+				"status_code": 200,
+			},
+		},
+	]
+
+	for mismatch in mismatches:
+		var rejected_host := _ManagerHostStub.new()
+		rejected_host.live_status = mismatch["live"]
+		var rejected_manager := McpServerLifecycleManagerScript.new(rejected_host)
+		rejected_manager.start_server()
+		assert_eq(
+			rejected_manager.get_state(),
+			McpServerState.GUARDED,
+			"%s must not pass the guarded lane proof" % mismatch["label"],
+		)
+		assert_true(
+			rejected_manager.is_connection_blocked(),
+			"%s must keep the isolated lane blocked" % mismatch["label"],
+		)
+		assert_eq(
+			rejected_host.resume_lane_calls,
+			0,
+			"%s must not resume the lane" % mismatch["label"],
+		)
+		rejected_host.free()
+
+	var matching_host := _ManagerHostStub.new()
+	matching_host.live_status = {
+		"name": "godot-ai",
+		"version": expected_version,
+		"ws_port": expected_ws,
+		"status_code": 200,
+	}
+	var matching_manager := McpServerLifecycleManagerScript.new(matching_host)
+	matching_manager.start_server()
+	var matching_state := matching_manager.get_state()
+	var matching_path := matching_manager.get_startup_path()
+	var matching_resume_calls := matching_host.resume_lane_calls
+	matching_host.free()
+	GodotAiPlugin._resolved_ws_port = saved_ws
+	GodotAiPlugin._server_started_this_session = saved_guard
+
+	assert_eq(matching_state, McpServerState.READY)
+	assert_eq(matching_path, McpStartupPath.GUARDED)
+	assert_eq(matching_resume_calls, 1, "only a complete endpoint proof may resume the lane")
+
+
+func test_terminal_lane_diagnosis_propagates_exact_block_reason() -> void:
+	if not McpClientConfigurator.isolated_lane_requested():
+		skip("requires an explicit GODOT_AI_HTTP_PORT/GODOT_AI_WS_PORT lane")
+		return
+	var host := _ManagerHostStub.new()
+	var conn := McpConnection.new()
+	conn.connect_blocked = true
+	conn.connect_block_reason = "Resolving isolated Godot AI lane before connecting"
+	host._connection = conn
+	var manager := McpServerLifecycleManagerScript.new(host)
+	var terminal_reason := "terminal async lane failure"
+
+	manager._block_isolated_lane_connection(terminal_reason)
+	var manager_blocked := manager.is_connection_blocked()
+	var status_reason := str(manager.get_status_dict().get("message", ""))
+	var connection_blocked := conn.connect_blocked
+	var connection_reason := conn.connect_block_reason
+	conn.free()
+	host.free()
+
+	assert_true(manager_blocked)
+	assert_true(connection_blocked)
+	assert_eq(status_reason, terminal_reason)
+	assert_eq(
+		connection_reason,
+		terminal_reason,
+		"late async outcomes must replace the temporary lane-start reason",
+	)
+
+
 func test_prepare_for_update_reload_clears_spawn_guard() -> void:
+	var saved_guard := GodotAiPlugin._server_started_this_session
 	GodotAiPlugin._server_started_this_session = true
 	var host := _ManagerHostStub.new()
 	var manager := McpServerLifecycleManagerScript.new(host)
@@ -516,7 +765,7 @@ func test_prepare_for_update_reload_clears_spawn_guard() -> void:
 	manager.prepare_for_update_reload()
 	var guard_after := GodotAiPlugin._server_started_this_session
 	host.free()
-	GodotAiPlugin._server_started_this_session = false
+	GodotAiPlugin._server_started_this_session = saved_guard
 
 	assert_false(guard_after)
 
